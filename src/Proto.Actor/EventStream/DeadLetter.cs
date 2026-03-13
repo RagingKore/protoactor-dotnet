@@ -1,70 +1,121 @@
 // -----------------------------------------------------------------------
 // <copyright file="DeadLetter.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
 
-// ReSharper disable once CheckNamespace
-
-// ReSharper disable once CheckNamespace
-
 using System;
+using System.Collections.Generic;
 using JetBrains.Annotations;
+using Proto.Extensions;
+using Proto.Mailbox;
 using Proto.Metrics;
 
-namespace Proto
+// ReSharper disable once CheckNamespace
+namespace Proto;
+
+/// <summary>
+///     A wrapper for a message that could not be delivered to the original recipient. Such message is wrapped in
+///     a <see cref="DeadLetterEvent{T}" /> by the <see cref="DeadLetterProcess" /> and forwarded
+///     to the <see cref="EventStream{T}" />
+/// </summary>
+[PublicAPI]
+public class DeadLetterEvent
 {
-    [PublicAPI]
-    public class DeadLetterEvent
+    public DeadLetterEvent(PID pid, object message, PID? sender) : this(pid, message, sender, MessageHeader.Empty)
     {
-        public DeadLetterEvent(PID pid, object message, PID? sender) : this(pid, message, sender, MessageHeader.Empty)
-        {
-        }
-
-        public DeadLetterEvent(PID pid, object message, PID? sender, MessageHeader? header)
-        {
-            Pid = pid;
-            Message = message;
-            Sender = sender;
-            Header = header ?? MessageHeader.Empty;
-        }
-
-        public PID Pid { get; }
-        public object Message { get; }
-        public PID? Sender { get; }
-        public MessageHeader Header { get; }
     }
 
-    public class DeadLetterProcess : Process
+    public DeadLetterEvent(PID pid, object message, PID? sender, MessageHeader? header)
     {
-        public DeadLetterProcess(ActorSystem system) : base(system)
-        {
-        }
+        Pid = pid;
+        Message = message;
+        Sender = sender;
+        Header = header ?? MessageHeader.Empty;
+    }
 
-        protected internal override void SendUserMessage(PID pid, object message)
-        {
-            System.Metrics.Get<ActorMetrics>().DeadletterCount.Inc(new[] {System.Id, System.Address, message.GetType().Name});
-            var (msg, sender, header) = MessageEnvelope.Unwrap(message);
-            System.EventStream.Publish(new DeadLetterEvent(pid, msg, sender, header));
-            if (sender is null) return;
+    /// <summary>
+    ///     The PID of the actor that was the original recipient of the message.
+    /// </summary>
+    public PID Pid { get; }
 
-            System.Root.Send(sender, msg is PoisonPill
-                ? new Terminated {Who = pid, Why = TerminatedReason.NotFound}
-                : new DeadLetterResponse {Target = pid}
+    /// <summary>
+    ///     The message that could not be delivered to the original recipient.
+    /// </summary>
+    public object Message { get; }
+
+    /// <summary>
+    ///     Sender of the message.
+    /// </summary>
+    public PID? Sender { get; }
+
+    /// <summary>
+    ///     Headers of the message.
+    /// </summary>
+    public MessageHeader Header { get; }
+
+    public override string ToString() =>
+        $"DeadLetterEvent: [ Pid: {Pid}, Message: {Message.GetMessageTypeName()}:{Message}, Sender: {Sender}, Headers: {Header} ]";
+}
+
+/// <summary>
+///     A process that receives messages, that cannot be handled by the original recipients e.g. because they have been
+///     stopped.
+///     The message is then forwarded to the <see cref="EventStream{T}" /> as a <see cref="DeadLetterEvent" />
+/// </summary>
+public class DeadLetterProcess : Process
+{
+    public DeadLetterProcess(ActorSystem system) : base(system)
+    {
+    }
+
+    protected internal override void SendUserMessage(PID pid, object message)
+    {
+        var (msg, sender, header) = MessageEnvelope.Unwrap(message);
+
+        if (System.Metrics.Enabled)
+        {
+            ActorMetrics.DeadletterCount.Add(1,
+                new KeyValuePair<string, object?>("id", System.Id),
+                new KeyValuePair<string, object?>("address", System.Address),
+                new KeyValuePair<string, object?>("messagetype", msg.GetType().Name)
             );
         }
 
-        protected internal override void SendSystemMessage(PID pid, object message)
+        System.EventStream.Publish(new DeadLetterEvent(pid, msg, sender, header));
+
+        if (sender is null)
         {
-            System.Metrics.Get<ActorMetrics>().DeadletterCount.Inc(new[] {System.Id, System.Address, message.GetType().Name});
-            System.EventStream.Publish(new DeadLetterEvent(pid, message, null, null));
+            return;
         }
+
+        System.Root.Send(sender, new DeadLetterResponse { Target = pid });
     }
 
-    public class DeadLetterException : Exception
+    protected internal override void SendSystemMessage(PID pid, SystemMessage message)
     {
-        public DeadLetterException(PID pid) : base($"{pid} no longer exists")
+        if (System.Metrics.Enabled)
         {
+            ActorMetrics.DeadletterCount.Add(1, new KeyValuePair<string, object?>("id", System.Id),
+                new KeyValuePair<string, object?>("address", System.Address),
+                new KeyValuePair<string, object?>("messagetype", message.GetMessageTypeName()));
         }
+
+        //trying to watch a dead pid returns terminated, NotFound
+        if (message is Watch watch)
+        {
+            System.Root.Send(watch.Watcher, new Terminated { Who = pid, Why = TerminatedReason.NotFound });
+        }
+
+        System.EventStream.Publish(new DeadLetterEvent(pid, message, null, null));
+    }
+}
+
+#pragma warning disable RCS1194
+public class DeadLetterException : Exception
+#pragma warning restore RCS1194
+{
+    public DeadLetterException(PID pid) : base($"{pid} no longer exists")
+    {
     }
 }

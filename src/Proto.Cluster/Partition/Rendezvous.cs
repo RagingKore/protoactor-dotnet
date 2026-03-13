@@ -1,89 +1,119 @@
 ﻿// -----------------------------------------------------------------------
 // <copyright file="Rendezvous.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 
-namespace Proto.Cluster.Partition
+namespace Proto.Cluster.Partition;
+
+/// <summary>
+///     A dotnet port of rendezvous.go
+/// </summary>
+public class Rendezvous
 {
-    /// <summary>
-    ///     A dotnet port of rendezvous.go
-    /// </summary>
-    public class Rendezvous
+    private MemberData[] _members = Array.Empty<MemberData>();
+    private Dictionary<string, MemberData[]> _membersByKind = new();
+
+    public string GetOwnerMemberByIdentity(string identity)
     {
-        private MemberData[] _members = Array.Empty<MemberData>();
-
-        public string GetOwnerMemberByIdentity(string identity)
+        switch (_members.Length)
         {
-            switch (_members.Length)
-            {
-                case 0:
-                    return "";
-                case 1:
-                    return _members[0].Info.Address;
-            }
-
-            var keyBytes = Encoding.UTF8.GetBytes(identity);
-
-            uint maxScore = 0;
-            Member? maxNode = null;
-
-            foreach (var member in _members)
-            {
-                var hashBytes = member.Hash;
-                var score = RdvHash(hashBytes, keyBytes);
-
-                if (score <= maxScore) continue;
-
-                maxScore = score;
-                maxNode = member.Info;
-            }
-
-            return maxNode?.Address ?? "";
+            case 0:
+                return "";
+            case 1:
+                return _members[0].Info.Address;
         }
 
-        // ReSharper disable once ParameterTypeCanBeEnumerable.Global
-        public void UpdateMembers(IEnumerable<Member> members) => _members = members
+        var keyBytes = Encoding.UTF8.GetBytes(identity);
+        return FindMaxScoreMember(_members, keyBytes)?.Address ?? "";
+    }
+
+    // ReSharper disable once ParameterTypeCanBeEnumerable.Global
+    public void UpdateMembers(IEnumerable<Member> members)
+    {
+        _members = members
             .OrderBy(m => m.Address)
             .Select(x => new MemberData(x))
             .ToArray();
 
-        private static uint RdvHash(byte[] node, byte[] key)
+        // cache members by kind to avoid repeated filtering at lookup time
+        _membersByKind = _members
+            .SelectMany(m => m.Info.Kinds.Select(k => (Kind: k, Member: m)))
+            .GroupBy(x => x.Kind)
+            .ToDictionary(g => g.Key, g => g.Select(x => x.Member).ToArray());
+    }
+
+    private static uint RdvHash(byte[] node, byte[] key)
+    {
+        var hashBytes = MergeBytes(key, node);
+
+        return MurmurHash2.Hash(hashBytes);
+    }
+
+    private static byte[] MergeBytes(byte[] front, byte[] back)
+    {
+        var combined = new byte[front.Length + back.Length];
+        Array.Copy(front, combined, front.Length);
+        Array.Copy(back, 0, combined, front.Length, back.Length);
+
+        return combined;
+    }
+
+    public void Debug()
+    {
+        foreach (var m in _members)
         {
-            var hashBytes = MergeBytes(key, node);
-            return MurmurHash2.Hash(hashBytes);
+            Console.WriteLine(m.Info);
+        }
+    }
+
+    public string GetOwnerMemberByIdentity(ClusterIdentity ci)
+    {
+        if (!_membersByKind.TryGetValue(ci.Kind, out var members))
+        {
+            return "";
         }
 
-        private static byte[] MergeBytes(byte[] front, byte[] back)
-        {
-            var combined = new byte[front.Length + back.Length];
-            Array.Copy(front, combined, front.Length);
-            Array.Copy(back, 0, combined, front.Length, back.Length);
-            return combined;
-        }
+        var keyBytes = Encoding.UTF8.GetBytes(ci.Identity);
+        return FindMaxScoreMember(members, keyBytes)?.Address ?? "";
+    }
 
-        private readonly struct MemberData
+    private static Member? FindMaxScoreMember(MemberData[] members, byte[] keyBytes)
+    {
+        uint maxScore = 0;
+        Member? maxNode = null;
+
+        foreach (var member in members)
         {
-            public MemberData(Member member)
+            var hashBytes = member.Hash;
+            var score = RdvHash(hashBytes, keyBytes);
+
+            if (score <= maxScore)
             {
-                Info = member;
-                Hash = Encoding.UTF8.GetBytes(member.Address);
+                continue;
             }
 
-            public Member Info { get; }
-            public byte[] Hash { get; }
+            maxScore = score;
+            maxNode = member.Info;
         }
 
-        public void Debug()
+        return maxNode;
+    }
+
+    private readonly struct MemberData
+    {
+        public MemberData(Member member)
         {
-            foreach (var m in _members)
-            {
-                Console.WriteLine(m.Info);
-            }
+            Info = member;
+            Hash = Encoding.UTF8.GetBytes(member.Address);
         }
+
+        public Member Info { get; }
+        public byte[] Hash { get; }
     }
 }

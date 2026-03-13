@@ -1,15 +1,15 @@
 // -----------------------------------------------------------------------
 // <copyright file="AgentServiceRegistration.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
-namespace Proto.Cluster.Testing
+
+namespace Proto.Cluster.Testing;
+
+public class AgentServiceRegistration
 {
-    public class AgentServiceRegistration
-    {
-        public string ID { get; set; }
-        public string Host { get; set; }
-        public int Port { get; set; }
-        public string[] Kinds { get; set; }
-    }
+    public string ID { get; set; }
+    public string Host { get; set; }
+    public int Port { get; set; }
+    public string[] Kinds { get; set; }
 }

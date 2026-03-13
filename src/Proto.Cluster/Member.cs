@@ -1,22 +1,31 @@
 ﻿// -----------------------------------------------------------------------
 // <copyright file="Member.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
+using System;
 using JetBrains.Annotations;
 
-namespace Proto.Cluster
+namespace Proto.Cluster;
+
+[PublicAPI]
+public partial class Member
 {
-    [PublicAPI]
-    public partial class Member
-    {
-        public string Address => Host + ":" + Port;
+    /// <summary>
+    ///     Gets the network address of the member.
+    /// </summary>
+    public string Address => Host + ":" + Port;
 
-        /// <summary>
-        ///     Node local index
-        /// </summary>
-        public int Index { get; internal set; }
+    /// <summary>
+    ///     Gets a representation of this member for logging
+    /// </summary>
+    /// <returns></returns>
+    public string ToLogString() => $"Member Address:{Address} ID:{Id}";
 
-        public string ToLogString() => $"Member Address:{Address} ID:{Id}";
-    }
+    /// <summary>
+    ///    Represents the age of the member in milliseconds
+    ///    Used to determine if one member is newer than another.
+    /// </summary>
+    public long Age { get; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 }

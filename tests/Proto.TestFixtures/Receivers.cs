@@ -1,15 +1,14 @@
 ﻿// -----------------------------------------------------------------------
 //  <copyright file="ActorFixture.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2024 Asynkron AB All rights reserved
 //  </copyright>
 // -----------------------------------------------------------------------
 
 using System.Threading.Tasks;
 
-namespace Proto.TestFixtures
+namespace Proto.TestFixtures;
+
+public static class Receivers
 {
-    public static class Receivers
-    {
-        public static readonly Receive EmptyReceive = c => Task.CompletedTask;
-    }
+    public static readonly Receive EmptyReceive = c => Task.CompletedTask;
 }

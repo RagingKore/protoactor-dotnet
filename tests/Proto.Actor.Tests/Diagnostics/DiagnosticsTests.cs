@@ -1,49 +1,53 @@
 // -----------------------------------------------------------------------
 // <copyright file="DiagnosticsTests.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2021 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2024 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
 using System;
 using System.Threading.Tasks;
 using Proto.Diagnostics;
 using Xunit;
 
-namespace Proto.Tests.Diagnostics
+namespace Proto.Tests.Diagnostics;
+
+public class MyDiagnosticsActor : IActor, IActorDiagnostics
 {
-    public class MyDiagnosticsActor : IActor, IActorDiagnostics
-    {
-        public Task ReceiveAsync(IContext context) => Task.CompletedTask;
+    public Task ReceiveAsync(IContext context) => Task.CompletedTask;
 
-        public string GetDiagnosticsString() => "Hello World";
+    public string GetDiagnosticsString() => "Hello World";
+}
+
+public class DiagnosticsTests
+{
+    [Fact]
+    public async Task CanListPidsInProcessRegistry()
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+
+        var props = Props.FromProducer(() => new MyDiagnosticsActor());
+
+        var pids = system.ProcessRegistry.Find("MyActor");
+        Assert.Empty(pids);
+
+        context.SpawnNamed(props, "MyActor");
+
+        pids = system.ProcessRegistry.Find("MyActor");
+        Assert.Single(pids);
     }
-    public class DiagnosticsTests
+
+    [Fact]
+    public async Task CanGetDiagnosticsStringFromActorDiagnostics()
     {
-        private static readonly ActorSystem System = new();
-        private static readonly RootContext Context = System.Root;
-        
-        [Fact]
-        public void CanListPidsInProcessRegistry()
-        {
-            var props = Props.FromProducer(() => new MyDiagnosticsActor());
+        await using var system = new ActorSystem();
+        var context = system.Root;
 
-            var pids = System.ProcessRegistry.SearchByName("MyActor");
-            Assert.Empty(pids);
-            
-            var pid = Context.SpawnNamed(props,"MyActor");
-            
-            pids = System.ProcessRegistry.SearchByName("MyActor");
-            Assert.Single(pids);
-        }
-        
-        [Fact]
-        public async Task CanGetDiagnosticsStringFromActorDiagnostics()
-        {
-            var props = Props.FromProducer(() => new MyDiagnosticsActor());
+        var props = Props.FromProducer(() => new MyDiagnosticsActor());
 
-            var pid = Context.Spawn(props);
+        var pid = context.Spawn(props);
 
-            var res = await DiagnosticTools.GetDiagnosticsString(System, pid);
-            Assert.Contains("Hello World", res, StringComparison.InvariantCulture);
-        }
+        var res = await DiagnosticTools.GetDiagnosticsString(system, pid);
+        Assert.Contains("Hello World", res, StringComparison.InvariantCulture);
     }
 }

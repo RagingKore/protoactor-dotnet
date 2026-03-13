@@ -1,185 +1,254 @@
 // -----------------------------------------------------------------------
 // <copyright file="KubernetesProvider.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using JetBrains.Annotations;
 using k8s;
 using k8s.Models;
 using Microsoft.Extensions.Logging;
-using Microsoft.Rest;
-using Proto.Cluster.Data;
-using Proto.Mailbox;
+using Proto.Diagnostics;
+using Proto.Utils;
 using static Proto.Cluster.Kubernetes.Messages;
 using static Proto.Cluster.Kubernetes.ProtoLabels;
 
-namespace Proto.Cluster.Kubernetes
+namespace Proto.Cluster.Kubernetes;
+
+/// <summary>
+///     Clustering provider that uses Kubernetes API to publish and discover members. Preferred provider
+///     for Kubernetes deployments.
+/// </summary>
+[PublicAPI]
+public class KubernetesProvider : BaseClusterProvider
 {
-    [PublicAPI]
-    public class KubernetesProvider : IClusterProvider
+    private static readonly ILogger _logger = Log.CreateLogger<KubernetesProvider>();
+    private readonly KubernetesProviderConfig _config;
+
+    private PID _clusterMonitor = null!;
+    private string _podName = null!;
+
+    protected override ILogger Logger => _logger;
+
+    internal KubernetesProviderConfig Config => _config;
+
+    public override async Task<DiagnosticsEntry[]> GetDiagnostics()
     {
-        private static readonly ILogger Logger = Log.CreateLogger<KubernetesProvider>();
-
-        private readonly IKubernetes _kubernetes;
-        private string _address;
-        private Cluster _cluster;
-
-        private PID _clusterMonitor;
-        private string _clusterName;
-        private string _host;
-        private string[] _kinds;
-        private MemberList _memberList;
-        private string _podName;
-        private int _port;
-
-        public KubernetesProvider(IKubernetes kubernetes)
+        try
         {
-            if (KubernetesExtensions.GetKubeNamespace() is null)
-                throw new InvalidOperationException("The application doesn't seem to be running in Kubernetes");
+            var selector = $"{LabelCluster}={_clusterName}";
+            using var client = _config.ClientFactory();
+            var res = await client.CoreV1.ListNamespacedPodWithHttpMessagesAsync(
+                KubernetesExtensions.GetKubeNamespace(),
+                labelSelector: selector,
+                timeoutSeconds: _config.WatchTimeoutSeconds,
+                watch: false).ConfigureAwait(false);
 
-            _kubernetes = kubernetes;
+            var pods = new DiagnosticsEntry("KubernetesProvider", "Pods", res.Body);
+
+            return new[] { pods };
         }
-
-        public async Task StartMemberAsync(Cluster cluster)
+        catch (Exception x)
         {
-            var memberList = cluster.MemberList;
-            var clusterName = cluster.Config.ClusterName;
-            var (host, port) = cluster.System.GetAddress();
-            var kinds = cluster.GetClusterKinds();
-            _cluster = cluster;
-            _memberList = memberList;
-            _clusterName = clusterName;
-            _host = host;
-            _port = port;
-            _kinds = kinds;
-            _address = host + ":" + port;
-            StartClusterMonitor();
-            await RegisterMemberAsync();
-            MonitorMemberStatusChanges();
+            return new[] { new DiagnosticsEntry("KubernetesProvider", "Exception", x.ToString()) };
         }
-
-        public Task StartClientAsync(Cluster cluster)
-        {
-            var memberList = cluster.MemberList;
-            var clusterName = cluster.Config.ClusterName;
-            var (host, port) = cluster.System.GetAddress();
-            _cluster = cluster;
-            _memberList = memberList;
-            _clusterName = clusterName;
-            _host = host;
-            _port = port;
-            _kinds = Array.Empty<string>();
-            StartClusterMonitor();
-            MonitorMemberStatusChanges();
-            return Task.CompletedTask;
-        }
-
-        public async Task ShutdownAsync(bool graceful)
-        {
-            await DeregisterMemberAsync(_cluster);
-            await _cluster.System.Root.StopAsync(_clusterMonitor);
-        }
-
-        public async Task RegisterMemberAsync()
-        {
-            Logger.LogInformation("Registering service {PodName} on {PodIp}", _podName, _address);
-
-            var pod = await _kubernetes.ReadNamespacedPodAsync(_podName, KubernetesExtensions.GetKubeNamespace());
-            if (pod is null) throw new ApplicationException($"Unable to get own pod information for {_podName}");
-
-            Logger.LogInformation("Using Kubernetes namespace: " + pod.Namespace());
-
-            var matchingPort = pod.FindPort(_port);
-
-            if (matchingPort is null) Logger.LogWarning("Registration port doesn't match any of the container ports");
-
-            Logger.LogInformation("Using Kubernetes port: " + _port);
-
-            var existingLabels = pod.Metadata.Labels;
-
-            var labels = new Dictionary<string, string>
-            {
-                [LabelCluster] = _clusterName,
-                [LabelPort] = _port.ToString(),
-                [LabelMemberId] = _cluster.System.Id
-            };
-
-            foreach (var kind in _kinds)
-            {
-                var labelKey = $"{LabelKind}-{kind}";
-                labels.TryAdd(labelKey, "true");
-            }
-
-            //add existing labels back
-            foreach (var existing in existingLabels)
-            {
-                labels.TryAdd(existing.Key, existing.Value);
-            }
-
-            try
-            {
-                await _kubernetes.ReplacePodLabels(_podName, KubernetesExtensions.GetKubeNamespace(), labels);
-            }
-            catch (HttpOperationException e)
-            {
-                Logger.LogError(e, "Unable to update pod labels, registration failed");
-                throw;
-            }
-        }
-
-        private void StartClusterMonitor()
-        {
-            var props = Props
-                .FromProducer(() => new KubernetesClusterMonitor(_cluster, _kubernetes))
-                .WithGuardianSupervisorStrategy(Supervision.AlwaysRestartStrategy)
-                .WithDispatcher(Dispatchers.SynchronousDispatcher);
-            _clusterMonitor = _cluster.System.Root.SpawnNamed(props, "ClusterMonitor");
-            _podName = KubernetesExtensions.GetPodName();
-
-            _cluster.System.Root.Send(
-                _clusterMonitor,
-                new RegisterMember
-                {
-                    ClusterName = _clusterName,
-                    Address = _address,
-                    Port = _port,
-                    Kinds = _kinds,
-                    MemberId = _cluster.System.Id
-                }
-            );
-        }
-
-        public async Task DeregisterMemberAsync(Cluster cluster)
-        {
-            Logger.LogInformation("Unregistering service {PodName} on {PodIp}", _podName, _address);
-
-            var kubeNamespace = KubernetesExtensions.GetKubeNamespace();
-
-            var pod = await _kubernetes.ReadNamespacedPodAsync(_podName, kubeNamespace);
-
-            foreach (var kind in _kinds)
-            {
-                try
-                {
-                    var labelKey = $"{LabelKind}-{kind}";
-                    pod.SetLabel(labelKey, null);
-                }
-                catch (Exception x)
-                {
-                    Logger.LogError(x, "Failed to remove label");
-                }
-            }
-
-            pod.SetLabel(LabelCluster, null);
-
-            await _kubernetes.ReplacePodLabels(_podName, kubeNamespace, pod.Labels());
-
-            cluster.System.Root.Send(_clusterMonitor, new DeregisterMember());
-        }
-
-        public void MonitorMemberStatusChanges() => _cluster.System.Root.Send(_clusterMonitor, new StartWatchingCluster(_clusterName));
     }
+
+    public KubernetesProvider() : this(new KubernetesProviderConfig())
+    {
+    }
+
+    public KubernetesProvider(KubernetesProviderConfig config)
+    {
+        if (!KubernetesExtensions.TryGetKubeNamespace(out _))
+        {
+            throw new InvalidOperationException("The application doesn't seem to be running in Kubernetes");
+        }
+
+        _config = config;
+    }
+
+    [Obsolete("Do not pass a Kubernetes client directly, pass Client factory as part of Config, or use Config defaults",
+        true)]
+    public KubernetesProvider(IKubernetes kubernetes, KubernetesProviderConfig config)
+    {
+    }
+
+    public override async Task StartMemberAsync(Cluster cluster)
+    {
+        await base.StartMemberAsync(cluster).ConfigureAwait(false);
+        MonitorMemberStatusChanges();
+    }
+
+    public override Task StartClientAsync(Cluster cluster)
+    {
+        base.StartClientAsync(cluster);
+        MonitorMemberStatusChanges();
+        return Task.CompletedTask;
+    }
+
+    public override async Task ShutdownAsync(bool graceful)
+    {
+        await DeregisterMemberAsync(_cluster).ConfigureAwait(false);
+        await _cluster.System.Root.StopAsync(_clusterMonitor).ConfigureAwait(false);
+    }
+
+    protected override async Task RegisterMemberInner()
+    {
+        var kubernetes = _config.ClientFactory();
+
+        Logger.LogInformation("[Cluster][KubernetesProvider] Registering service {PodName} on {PodIp}", _podName,
+            _address);
+
+        var pod = await kubernetes.CoreV1.ReadNamespacedPodAsync(_podName, KubernetesExtensions.GetKubeNamespace()).ConfigureAwait(false);
+
+        if (pod is null)
+        {
+            throw new ApplicationException($"Unable to get own pod information for {_podName}");
+        }
+
+        Logger.LogInformation("[Cluster][KubernetesProvider] Using Kubernetes namespace: {Namespace}", pod.Namespace());
+
+        Logger.LogInformation("[Cluster][KubernetesProvider] Using Kubernetes port: {Port}", _port);
+
+        var labels = new Dictionary<string, string>
+        {
+            [LabelCluster] = _clusterName,
+            [LabelPort] = _port.ToString(),
+            [LabelMemberId] = _cluster.System.Id,
+        };
+
+        AppendHostToPodLabels(pod, labels);
+
+        KubernetesPodMetadata.TryAddNonClusterEntries(pod.Metadata.Labels, labels);
+
+        var annotations = new Dictionary<string, string>
+        {
+            [AnnotationKinds] = string.Join(';', _kinds),
+        };
+
+        if (pod.Metadata.Annotations is not null)
+        {
+            KubernetesPodMetadata.TryAddNonClusterEntries(pod.Metadata.Annotations, annotations);
+        }
+
+        try
+        {
+            await kubernetes.ReplacePodLabelsAndAnnotations(_podName, KubernetesExtensions.GetKubeNamespace(), pod, labels, annotations).ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            Logger.LogError(e,
+                "[Cluster][KubernetesProvider] Unable to update pod labels, registration failed. Labels : {Labels}",
+                labels);
+
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// k8s labels have a limit of 63 characters, so we need to be careful about what we add to the labels.
+    /// </summary>
+    protected void AppendHostToPodLabels(V1Pod pod, Dictionary<string, string> labels)
+    {
+        // If our advertised host is something other then our pod IP, we need to add a label to the pod
+        // So others can find us by our advertised host.
+        var podId = pod.Status.PodIP;
+        if (!_host.Equals(podId, StringComparison.OrdinalIgnoreCase))
+        {
+            if (_host.Length <= 63)
+            {
+                labels[LabelHost] = _host;
+            }
+            else
+            {
+                var dnsPostfix = $".{pod.Namespace()}.svc.{_config.ClusterDomain}";
+
+                // If we have a subdomain, then we can add that to the dnsPostfix, as it will be known to the cluster
+                if (!string.IsNullOrEmpty(pod.Spec.Subdomain))
+                {
+                    dnsPostfix = $".{pod.Spec.Subdomain}{dnsPostfix}";
+                }
+
+                if (_host.EndsWith(dnsPostfix))
+                {
+                    labels[LabelHostPrefix] = _host[..^dnsPostfix.Length];
+                }
+                else
+                {
+                    // TODO: what else could we do here?
+                    // Going to fall back to the IP address, and hope that works...
+                    Logger.LogWarning(
+                        "[Cluster][KubernetesProvider] AdvertisedHost is too long to be used as a label, falling back to PodID, host: {Host}",
+                        _host);
+                }
+            }
+        }
+    }
+
+    protected override void StartClusterMonitor()
+    {
+        var props = Props
+            .FromProducer(() => new KubernetesClusterMonitor(_cluster, _config))
+            .WithGuardianSupervisorStrategy(Supervision.AlwaysRestartStrategy);
+
+        _clusterMonitor = _cluster.System.Root.SpawnNamedSystem(props, "$kubernetes-cluster-monitor");
+        _podName = KubernetesExtensions.GetPodName();
+
+        _cluster.System.Root.Send(
+            _clusterMonitor,
+            new RegisterMember
+            {
+                ClusterName = _clusterName,
+                Address = _address,
+                Port = _port,
+                Kinds = _kinds,
+                MemberId = _cluster.System.Id
+            }
+        );
+    }
+
+    private async Task DeregisterMemberAsync(Cluster cluster)
+    {
+        var logger = Logger;
+        await Retry.Try(() => DeregisterMemberInner(cluster), onError: OnError, onFailed: OnFailed).ConfigureAwait(false);
+
+        void OnError(int attempt, Exception exception) =>
+            logger.LogWarning(exception, "Failed to deregister service");
+
+        void OnFailed(Exception exception) => logger.LogError(exception, "Failed to deregister service");
+    }
+
+    private async Task DeregisterMemberInner(Cluster cluster)
+    {
+        var kubernetes = _config.ClientFactory();
+
+        Logger.LogInformation("[Cluster][KubernetesProvider] Unregistering service {PodName} on {PodIp}", _podName,
+            _address);
+
+        var kubeNamespace = KubernetesExtensions.GetKubeNamespace();
+
+        var pod = await kubernetes.CoreV1.ReadNamespacedPodAsync(_podName, kubeNamespace).ConfigureAwait(false);
+
+        if (pod?.Metadata is null)
+        {
+            cluster.System.Root.Send(_clusterMonitor, new DeregisterMember());
+            return;
+        }
+
+        var labels = KubernetesPodMetadata.ToNonClusterDictionary(pod.Metadata.Labels);
+
+        var annotations = KubernetesPodMetadata.ToNonClusterDictionary(pod.Metadata.Annotations);
+
+        await kubernetes.ReplacePodLabelsAndAnnotations(_podName, kubeNamespace, pod, labels, annotations).ConfigureAwait(false);
+
+        cluster.System.Root.Send(_clusterMonitor, new DeregisterMember());
+    }
+
+    private void MonitorMemberStatusChanges() =>
+        _cluster.System.Root.Send(_clusterMonitor, new StartWatchingCluster(_clusterName));
 }

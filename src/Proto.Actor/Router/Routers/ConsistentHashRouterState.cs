@@ -1,83 +1,70 @@
 // -----------------------------------------------------------------------
 // <copyright file="ConsistentHashRouterState.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
 using System;
-using System.Collections.Generic;
-using System.Linq;
 
-namespace Proto.Router.Routers
+namespace Proto.Router.Routers;
+
+internal class ConsistentHashRouterState : RouterState
 {
-    class ConsistentHashRouterState : RouterState
+    private readonly Func<string, uint> _hash;
+    private readonly Func<object, string>? _messageHasher;
+    private readonly int _replicaCount;
+    private readonly ISenderContext _senderContext;
+    private HashRing<PID>? _hashRing;
+
+    public ConsistentHashRouterState(
+        ISenderContext senderContext,
+        Func<string, uint> hash,
+        int replicaCount,
+        Func<object, string>? messageHasher
+    )
     {
-        private readonly Func<string, uint> _hash;
-        private readonly Func<object, string>? _messageHasher;
-        private readonly int _replicaCount;
-        private readonly Dictionary<string, PID> _routeeMap = new();
-        private readonly ISenderContext _senderContext;
-        private HashRing? _hashRing;
+        _senderContext = senderContext;
+        _hash = hash;
+        _replicaCount = replicaCount;
+        _messageHasher = messageHasher;
+    }
 
-        public ConsistentHashRouterState(
-            ISenderContext senderContext,
-            Func<string, uint> hash,
-            int replicaCount,
-            Func<object, string>? messageHasher
-        )
+    public override void SetRoutees(PID[] routees)
+    {
+        base.SetRoutees(routees);
+        _hashRing = new HashRing<PID>(routees, pid => pid.ToString(), _hash, _replicaCount);
+    }
+
+    public override void RouteMessage(object message)
+    {
+        if (_hashRing is null)
         {
-            _senderContext = senderContext;
-            _hash = hash;
-            _replicaCount = replicaCount;
-            _messageHasher = messageHasher;
+            throw new InvalidOperationException("Routees not set");
         }
 
-        public override HashSet<PID> GetRoutees() => _routeeMap.Values.ToHashSet();
+        var env = MessageEnvelope.Unwrap(message);
 
-        public override void SetRoutees(PID[] routees)
+        if (env.message is IHashable hashable)
         {
-            _routeeMap.Clear();
-            var nodes = new List<string>();
+            var key = hashable.HashBy();
+            var routee = _hashRing.GetNode(key);
 
-            foreach (var pid in routees)
-            {
-                var nodeName = pid.ToString();
-                nodes.Add(nodeName);
-                _routeeMap[nodeName] = pid;
-            }
-
-            _hashRing = new HashRing(nodes, _hash, _replicaCount);
+            //by design, just forward message
+            _senderContext.Send(routee, message);
         }
-
-        public override void RouteMessage(object message)
+        else if (_messageHasher is not null)
         {
-            if (_hashRing is null) throw new InvalidOperationException("Routees not set");
+            var key = _messageHasher(message);
+            var routee = _hashRing.GetNode(key);
 
-            var env = MessageEnvelope.Unwrap(message);
-
-            if (env.message is IHashable hashable)
-            {
-                var key = hashable.HashBy();
-                var node = _hashRing.GetNode(key);
-                var routee = _routeeMap[node];
-
-                //by design, just forward message
-                _senderContext.Send(routee, message);
-            }
-            else if (_messageHasher is not null)
-            {
-                var key = _messageHasher(message);
-                var node = _hashRing.GetNode(key);
-                var routee = _routeeMap[node];
-
-                //by design, just forward message
-                _senderContext.Send(routee, message);
-            }
-            else
-            {
-                throw new NotSupportedException(
-                    $"Message of type '{message.GetType().Name}' does not implement IHashable"
-                );
-            }
+            //by design, just forward message
+            _senderContext.Send(routee, message);
+        }
+        else
+        {
+            throw new NotSupportedException(
+                $"Message of type '{message.GetType().Name}' does not implement IHashable"
+            );
         }
     }
 }

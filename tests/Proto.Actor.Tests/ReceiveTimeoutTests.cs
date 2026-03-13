@@ -1,144 +1,203 @@
-﻿using System;
-using System.Runtime.CompilerServices;
+using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Proto.TestKit;
+using Proto.Timers;
 using Xunit;
 
-namespace Proto.Tests
+namespace Proto.Tests;
+
+public class ReceiveTimeoutTests
 {
-    public class ReceiveTimeoutTests
+    [Fact]
+    public async Task receive_timeout_received_within_expected_time()
     {
-        private static readonly ActorSystem System = new();
-        private static readonly RootContext Context = System.Root;
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var (probe, _) = system.CreateTestProbe();
 
-        [Fact]
-        public async Task receive_timeout_received_within_expected_time()
-        {
-            var timeoutReceived = false;
-            var receiveTimeoutWaiter = GetExpiringTaskCompletionSource();
-
-            var props = Props.FromFunc(context => {
-                    switch (context.Message)
-                    {
-                        case Started _:
-                            context.SetReceiveTimeout(TimeSpan.FromMilliseconds(150));
-                            break;
-                        case ReceiveTimeout _:
-                            timeoutReceived = true;
-                            receiveTimeoutWaiter.SetResult(0);
-                            break;
-                    }
-
-                    return Task.CompletedTask;
+        var props = Props.FromFunc(ctx =>
+            {
+                switch (ctx.Message)
+                {
+                    case Started:
+                        ctx.SetReceiveTimeout(TimeSpan.FromMilliseconds(150));
+                        break;
+                    case ReceiveTimeout msg:
+                        ctx.Send(probe.Self, msg);
+                        break;
                 }
-            );
-            Context.Spawn(props);
 
-            await GetSafeAwaitableTask(receiveTimeoutWaiter);
-            Assert.True(timeoutReceived);
-        }
+                return Task.CompletedTask;
+            }
+        );
 
-        [Fact]
-        public async Task receive_timeout_not_received_within_expected_time()
-        {
-            var timeoutReceived = false;
-            var actorStartedWaiter = GetExpiringTaskCompletionSource();
+        context.Spawn(props);
 
-            var props = Props.FromFunc(context => {
-                    switch (context.Message)
-                    {
-                        case Started _:
-                            context.SetReceiveTimeout(TimeSpan.FromMilliseconds(1500));
-                            actorStartedWaiter.SetResult(0);
-                            break;
-                        case ReceiveTimeout _:
-                            timeoutReceived = true;
-                            break;
-                    }
-
-                    return Task.CompletedTask;
-                }
-            );
-            Context.Spawn(props);
-
-            await GetSafeAwaitableTask(actorStartedWaiter);
-            Assert.False(timeoutReceived);
-        }
-
-        [Fact]
-        public async Task can_cancel_receive_timeout()
-        {
-            var timeoutReceived = false;
-            var endingTimeout = TimeSpan.MaxValue;
-            var autoExpiringWaiter = GetExpiringTaskCompletionSource(1500);
-
-            var props = Props.FromFunc(context => {
-                    switch (context.Message)
-                    {
-                        case Started _:
-                            context.SetReceiveTimeout(TimeSpan.FromMilliseconds(150));
-                            context.CancelReceiveTimeout();
-                            endingTimeout = context.ReceiveTimeout;
-                            break;
-                        case ReceiveTimeout _:
-                            timeoutReceived = true;
-                            autoExpiringWaiter.SetResult(0); // should never happen
-                            break;
-                    }
-
-                    return Task.CompletedTask;
-                }
-            );
-            Context.Spawn(props);
-
-            // this task should auto cancel
-            await GetSafeAwaitableTask(autoExpiringWaiter);
-
-            Assert.True(autoExpiringWaiter.Task.IsCanceled);
-            Assert.Equal(TimeSpan.Zero, endingTimeout);
-            Assert.False(timeoutReceived);
-        }
-
-        [Fact]
-        public async Task can_still_set_receive_timeout_after_cancelling()
-        {
-            var timeoutReceived = false;
-            var receiveTimeoutWaiter = GetExpiringTaskCompletionSource();
-
-            var props = Props.FromFunc(context => {
-                    switch (context.Message)
-                    {
-                        case Started _:
-                            context.SetReceiveTimeout(TimeSpan.FromMilliseconds(150));
-                            context.CancelReceiveTimeout();
-                            context.SetReceiveTimeout(TimeSpan.FromMilliseconds(150));
-                            break;
-                        case ReceiveTimeout _:
-                            timeoutReceived = true;
-                            receiveTimeoutWaiter.SetResult(0);
-                            break;
-                    }
-
-                    return Task.CompletedTask;
-                }
-            );
-            Context.Spawn(props);
-
-            await GetSafeAwaitableTask(receiveTimeoutWaiter);
-            Assert.True(timeoutReceived);
-        }
-
-        private TaskCompletionSource<int> GetExpiringTaskCompletionSource(int timeoutMs = 60000)
-        {
-            var tcs = new TaskCompletionSource<int>();
-            var ct = new CancellationTokenSource();
-            ct.Token.Register(() => tcs.TrySetCanceled());
-            ct.CancelAfter(timeoutMs);
-            return tcs;
-        }
-
-        private ConfiguredTaskAwaitable<Task<int>> GetSafeAwaitableTask(TaskCompletionSource<int> tcs) => tcs.Task
-            .ContinueWith(t => t) // suppress any TaskCanceledException
-            .ConfigureAwait(false);
+        await probe.ExpectNextSystemMessageAsync<ReceiveTimeout>();
     }
+
+    [Fact]
+    public async Task receive_timeout_received_within_expected_time_when_sending_ignored_messages()
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var (probe, _) = system.CreateTestProbe();
+
+        var props = Props.FromFunc(ctx =>
+            {
+                switch (ctx.Message)
+                {
+                    case Started:
+                        ctx.SetReceiveTimeout(TimeSpan.FromMilliseconds(150));
+                        break;
+                    case ReceiveTimeout msg:
+                        ctx.Send(probe.Self, msg);
+                        break;
+                }
+
+                return Task.CompletedTask;
+            }
+        );
+
+        var pid = context.Spawn(props);
+        var scheduler = context.Scheduler();
+        var cts = scheduler.SendRepeatedly(TimeSpan.Zero, TimeSpan.FromMilliseconds(100), pid, new IgnoreMe());
+
+        await probe.ExpectNextSystemMessageAsync<ReceiveTimeout>();
+        cts.Cancel();
+    }
+
+    [Fact]
+    public async Task receive_timeout_is_reset_by_influencing_messages()
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var (probe, _) = system.CreateTestProbe();
+
+        var props = Props.FromFunc(ctx =>
+            {
+                switch (ctx.Message)
+                {
+                    case Started:
+                        ctx.SetReceiveTimeout(TimeSpan.FromMilliseconds(200));
+                        break;
+                    case string:
+                        // regular messages reset the receive timeout
+                        break;
+                    case ReceiveTimeout msg:
+                        ctx.Send(probe.Self, msg);
+                        break;
+                }
+
+                return Task.CompletedTask;
+            }
+        );
+
+        var pid = context.Spawn(props);
+        var scheduler = context.Scheduler();
+        var cts = scheduler.SendRepeatedly(TimeSpan.Zero, TimeSpan.FromMilliseconds(50), pid, "tick");
+
+        await probe.ExpectNoMessageAsync(TimeSpan.FromMilliseconds(400));
+        cts.Cancel();
+
+        await probe.ExpectNextSystemMessageAsync<ReceiveTimeout>(TimeSpan.FromSeconds(2)); // allow time for any in-flight tick messages to complete before timeout fires
+    }
+
+    [Fact]
+    public async Task receive_timeout_not_received_within_expected_time()
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var (probe, _) = system.CreateTestProbe();
+
+        var props = Props.FromFunc(ctx =>
+            {
+                switch (ctx.Message)
+                {
+                    case Started:
+                        ctx.SetReceiveTimeout(TimeSpan.FromMilliseconds(1500));
+                        ctx.Send(probe.Self, "started");
+                        break;
+                    case ReceiveTimeout msg:
+                        ctx.Send(probe.Self, msg);
+                        break;
+                }
+
+                return Task.CompletedTask;
+            }
+        );
+
+        context.Spawn(props);
+
+        await probe.ExpectNextUserMessageAsync<string>();
+        await probe.ExpectNoMessageAsync(TimeSpan.FromMilliseconds(200));
+    }
+
+    [Fact]
+    public async Task can_cancel_receive_timeout()
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var (probe, _) = system.CreateTestProbe();
+
+        var endingTimeout = TimeSpan.MaxValue;
+
+        var props = Props.FromFunc(ctx =>
+            {
+                switch (ctx.Message)
+                {
+                    case Started:
+                        ctx.SetReceiveTimeout(TimeSpan.FromMilliseconds(150));
+                        ctx.CancelReceiveTimeout();
+                        endingTimeout = ctx.ReceiveTimeout;
+                        break;
+                    case ReceiveTimeout msg:
+                        ctx.Send(probe.Self, msg); // should never happen
+                        break;
+                }
+
+                return Task.CompletedTask;
+            }
+        );
+
+        context.Spawn(props);
+
+        await probe.ExpectNoMessageAsync(TimeSpan.FromMilliseconds(200));
+
+        Assert.Equal(TimeSpan.Zero, endingTimeout);
+    }
+
+    [Fact]
+    public async Task can_still_set_receive_timeout_after_cancelling()
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var (probe, _) = system.CreateTestProbe();
+
+        var props = Props.FromFunc(ctx =>
+            {
+                switch (ctx.Message)
+                {
+                    case Started:
+                        ctx.SetReceiveTimeout(TimeSpan.FromMilliseconds(150));
+                        ctx.CancelReceiveTimeout();
+                        ctx.SetReceiveTimeout(TimeSpan.FromMilliseconds(150));
+                        break;
+                    case ReceiveTimeout msg:
+                        ctx.Send(probe.Self, msg);
+                        break;
+                }
+
+                return Task.CompletedTask;
+            }
+        );
+
+        context.Spawn(props);
+
+        await probe.ExpectNextSystemMessageAsync<ReceiveTimeout>();
+    }
+
+    private record IgnoreMe : INotInfluenceReceiveTimeout;
 }
+

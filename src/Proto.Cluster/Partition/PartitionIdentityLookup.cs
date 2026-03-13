@@ -1,141 +1,203 @@
 // -----------------------------------------------------------------------
 // <copyright file="PartitionIdentityLookup.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Proto.Cluster.Identity;
 
-namespace Proto.Cluster.Partition
+namespace Proto.Cluster.Partition;
+
+/// <summary>
+///     Identity lookup that assigns identity owners with a consistent hashing algorithm. Activations are then
+///     spawned according to the <see cref="IMemberStrategy" />.
+///     See the <a href="https://proto.actor/docs/cluster/partition-idenity-lookup/">documentation</a> for more
+///     information.
+/// </summary>
+public class PartitionIdentityLookup : IIdentityLookup
 {
-    public class PartitionIdentityLookup : IIdentityLookup
+    public enum Mode
     {
-        private Cluster _cluster = null!;
-        private static readonly ILogger Logger = Log.CreateLogger<PartitionIdentityLookup>();
-        private PartitionManager _partitionManager = null!;
-        private readonly TimeSpan _identityHandoverTimeout;
-        private readonly TimeSpan _getPidTimeout;
+        /// <summary>
+        ///     Each member queries every member to get the currently owned identities
+        /// </summary>
+        Pull,
 
-        public PartitionIdentityLookup() : this(TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(1))
-        {
-        }
-        
-        public PartitionIdentityLookup(TimeSpan identityHandoverTimeout, TimeSpan getPidTimeout)
-        {
-            _identityHandoverTimeout = identityHandoverTimeout;
-            _getPidTimeout = getPidTimeout;
-        }
+        /// <summary>
+        ///     Experimental: Each activation owner publishes activations to the current identity owner
+        /// </summary>
+        Push
+    }
 
-        public async Task<PID?> GetAsync(ClusterIdentity clusterIdentity, CancellationToken ct)
-        {
-            ct = CancellationTokens.WithTimeout(_getPidTimeout);
-            //Get address to node owning this ID
-            var identityOwner = _partitionManager.Selector.GetIdentityOwner(clusterIdentity.Identity);
-            Logger.LogDebug("Identity belongs to {address}", identityOwner);
-            if (string.IsNullOrEmpty(identityOwner)) return null;
+    public enum Send
+    {
+        /// <summary>
+        ///     Experimental: Only identities which have changed owner since the last completed topology rebalance are sent.
+        /// </summary>
+        Delta,
 
-            var remotePid = PartitionManager.RemotePartitionIdentityActor(identityOwner);
+        /// <summary>
+        ///     All activations are sent on every topology rebalance
+        /// </summary>
+        Full
+    }
 
-            var req = new ActivationRequest
+    private static readonly ILogger Logger = Log.CreateLogger<PartitionIdentityLookup>();
+    private readonly PartitionConfig _config;
+    private readonly TimeSpan _getPidTimeout;
+    private readonly Func<Props, Props>? _configurePlacementProps;
+    private Cluster _cluster = null!;
+    private PartitionManager _partitionManager = null!;
+
+    public PartitionIdentityLookup(TimeSpan identityHandoverTimeout, TimeSpan getPidTimeout, Func<Props, Props>? configurePlacementProps = null)
+        : this(new PartitionConfig
             {
-                ClusterIdentity = clusterIdentity
-            };
+                GetPidTimeout = getPidTimeout,
+                RebalanceRequestTimeout = identityHandoverTimeout
+            }, configurePlacementProps)
+    {
+    }
 
-            Logger.LogDebug("Requesting remote PID from {Partition}:{Remote} {@Request}", identityOwner, remotePid, req
-            );
+    public PartitionIdentityLookup(Func<Props, Props>? configurePlacementProps = null) : this(new PartitionConfig(), configurePlacementProps)
+    {
+    }
 
-            try
+    public PartitionIdentityLookup(PartitionConfig? config, Func<Props, Props>? configurePlacementProps = null)
+    {
+        _config = config ?? new PartitionConfig();
+        _getPidTimeout = _config.GetPidTimeout;
+        _configurePlacementProps = configurePlacementProps;
+    }
+
+    public async Task<PID?> GetAsync(ClusterIdentity clusterIdentity, CancellationToken notUsed)
+    {
+        using var cts = new CancellationTokenSource(_getPidTimeout);
+        //Get address to node owning this ID
+        var (identityOwner, topologyHash) = _partitionManager.Selector.GetIdentityOwner(clusterIdentity.Identity);
+
+        if (Logger.IsEnabled(LogLevel.Trace))
+        {
+            Logger.LogTrace("[PartitionIdentity] Identity belongs to {Address}", identityOwner);
+        }
+
+        if (string.IsNullOrEmpty(identityOwner))
+        {
+            return null;
+        }
+
+        var remotePid = PartitionManager.RemotePartitionIdentityActor(identityOwner);
+
+        var req = new ActivationRequest
+        {
+            ClusterIdentity = clusterIdentity,
+            TopologyHash = topologyHash
+        };
+
+        if (Logger.IsEnabled(LogLevel.Trace))
+        {
+            Logger.LogTrace("[PartitionIdentity] Requesting remote PID from {Partition}:{Remote} {@Request}",
+                identityOwner, remotePid, req);
+        }
+
+        try
+        {
+            var resp = await _cluster.System.Root.RequestAsync<ActivationResponse>(remotePid, req, cts.Token).ConfigureAwait(false);
+
+            if (resp?.Pid != null)
             {
-                var resp = await _cluster.System.Root.RequestAsync<ActivationResponse>(remotePid, req, ct);
-
                 return resp.Pid;
             }
-            //TODO: decide if we throw or return null
-            catch (DeadLetterException)
+
+            if (resp?.InvalidIdentity == true)
             {
-                Logger.LogInformation("Remote PID request deadletter {@Request}, identity Owner {Owner}", req,identityOwner);
-                return null;
+                throw new IdentityIsBlockedException(clusterIdentity);
             }
-            catch (TimeoutException)
+
+            if (_config.DeveloperLogging)
             {
-                Logger.LogInformation("Remote PID request timeout {@Request}, identity Owner {Owner}", req,identityOwner);
-                return null;
+                Console.WriteLine("Failed");
             }
-            catch (Exception e)
-            {
-                Logger.LogError(e, "Error occured requesting remote PID {@Request}, identity Owner {Owner}", req,identityOwner);
-                return null;
-            }
+
+            return null;
         }
-
-
-        public void DumpState(ClusterIdentity clusterIdentity)
+        //TODO: decide if we throw or return null
+        catch (DeadLetterException)
         {
-            Console.WriteLine("Memberlist members:");
-            _cluster.MemberList.DumpState();
+            Logger.LogInformation(
+                "[PartitionIdentity] Remote PID request deadletter {@Request}, identity Owner {Owner}", req,
+                identityOwner);
 
-            Console.WriteLine("Partition manager selector:");
-            _partitionManager.Selector.DumpState();
-
-            //Get address to node owning this ID
-            var identityOwner = _partitionManager.Selector.GetIdentityOwner(clusterIdentity.Identity);
-
-            Console.WriteLine("Identity owner for ID:");
-            Console.WriteLine(identityOwner);
-
-            var remotePid = PartitionManager.RemotePartitionIdentityActor(identityOwner);
-
-            var req = new ActivationRequest
-            {
-                ClusterIdentity = clusterIdentity
-            };
-
-            var resp = _cluster.System.Root.RequestAsync<ActivationResponse>(remotePid, req, CancellationTokens.WithTimeout(5000)).Result;
-
-            Console.WriteLine("Target Pid:");
-
-            if (resp == null)
-            {
-                Console.WriteLine("Null response");
-            }
-            else if (resp.Pid == null)
-            {
-                Console.WriteLine("Null PID");
-            }
-            else
-            {
-                Console.WriteLine(resp.Pid);
-            }
+            return null;
         }
-
-        public Task RemovePidAsync(ClusterIdentity clusterIdentity, PID pid, CancellationToken ct)
+        catch (TimeoutException)
         {
-            var activationTerminated = new ActivationTerminated
+            if (_config.DeveloperLogging)
             {
-                Pid = pid,
-                ClusterIdentity = clusterIdentity,
-            };
-           
-            _cluster.MemberList.BroadcastEvent(activationTerminated);
-            
-            return Task.CompletedTask;
-        }
+                try
+                {
+                    var resp = await _cluster.System.Root.RequestAsync<Touched?>(remotePid, new Touch(),
+                        CancellationTokens.FromSeconds(2)).ConfigureAwait(false);
 
-        public Task SetupAsync(Cluster cluster, string[] kinds, bool isClient)
-        {
-            _cluster = cluster;
-            _partitionManager = new PartitionManager(cluster, isClient, _identityHandoverTimeout);
-            _partitionManager.Setup();
-            return Task.CompletedTask;
-        }
+                    if (resp == null)
+                    {
+                        if (_config.DeveloperLogging)
+                        {
+                            Console.WriteLine("Actor is blocked....");
+                        }
+                    }
+                }
+                catch
+                {
+                    if (_config.DeveloperLogging)
+                    {
+                        Console.WriteLine("Actor is blocked....");
+                    }
+                }
+            }
 
-        public Task ShutdownAsync()
+            Logger.LogInformation("[PartitionIdentity] Remote PID request timeout {@Request}, identity Owner {Owner}",
+                req, identityOwner);
+
+            return null;
+        }
+        catch (Exception e) when (e is not IdentityIsBlockedException)
         {
-            _partitionManager.Shutdown();
-            return Task.CompletedTask;
+            e.CheckFailFast();
+
+            Logger.LogError(e,
+                "[PartitionIdentity] Error occurred requesting remote PID {@Request}, identity Owner {Owner}", req,
+                identityOwner);
+
+            return null;
         }
     }
+
+    public Task RemovePidAsync(ClusterIdentity clusterIdentity, PID pid, CancellationToken ct)
+    {
+        var activationTerminated = new ActivationTerminated
+        {
+            Pid = pid,
+            ClusterIdentity = clusterIdentity
+        };
+
+        _cluster.MemberList.BroadcastEvent(activationTerminated);
+
+        return Task.CompletedTask;
+    }
+
+    public Task SetupAsync(Cluster cluster, string[] kinds, bool isClient)
+    {
+        _cluster = cluster;
+        _partitionManager = new PartitionManager(cluster, isClient, _config, _configurePlacementProps);
+        _partitionManager.Setup();
+
+        return Task.CompletedTask;
+    }
+
+    public Task ShutdownAsync() => _partitionManager.ShutdownAsync();
 }

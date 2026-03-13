@@ -1,37 +1,41 @@
 // -----------------------------------------------------------------------
 // <copyright file="MetricsExtensions.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2021 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Threading.Tasks;
 using JetBrains.Annotations;
-using Ubiquitous.Metrics;
 
-namespace Proto
+namespace Proto;
+
+[PublicAPI]
+public static class MetricsExtensions
 {
-    [PublicAPI]
-    public static class MetricsExtensions
+    public static async Task<T> Observe<T>(this Histogram<double> histogram, Func<Task<T>> factory,
+        params KeyValuePair<string, object?>[] tags)
     {
-        public static async Task<T> Observe<T>(this IHistogramMetric histogram, Func<Task<T>> factory, params string[] labels)
-        {
-            var sw = Stopwatch.StartNew();
-            var t = factory();
-            var res = await t;
-            sw.Stop();
-            histogram.Observe(sw, labels);
+        var sw = Stopwatch.StartNew();
+        var operationTask = factory();
+        var res = await operationTask.ConfigureAwait(false);
+        sw.Stop();
 
-            return res;
-        }
-        
-        public static async Task Observe(this IHistogramMetric histogram, Func<Task> factory, params string[] labels)
-        {
-            var sw = Stopwatch.StartNew();
-            var t = factory();
-            await t;
-            sw.Stop();
-            histogram.Observe(sw, labels);
-        }
+        histogram.Record(sw.Elapsed.TotalSeconds, tags);
+
+        return res;
+    }
+
+    public static async Task Observe(this Histogram<double> histogram, Func<Task> factory,
+        params KeyValuePair<string, object?>[] tags)
+    {
+        var sw = Stopwatch.StartNew();
+        var operationTask = factory();
+        await operationTask.ConfigureAwait(false);
+        sw.Stop();
+        histogram.Record(sw.Elapsed.TotalSeconds, tags);
     }
 }

@@ -1,46 +1,48 @@
 // -----------------------------------------------------------------------
 // <copyright file="MessageBatchTests.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2021 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2024 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using FluentAssertions;
 using Xunit;
 
-namespace Proto.Mailbox.Tests
+namespace Proto.Mailbox.Tests;
+
+public class MessageBatchTests
 {
-    public class MessageBatchTests
+    [Fact]
+    public async Task CanUnpackMessagesFromBatchAndReceiveInOrder()
     {
-        class MyMessageBatch : IMessageBatch
-        {
-            public IReadOnlyCollection<object> GetMessages() => new[] {"hello", "world", "batch"};
-        }
+        var batch = new MyMessageBatch();
 
-        [Fact]
-        public async Task CanUnpackMessagesFromBatchAndReceiveInOrder()
-        {
-            var batch = new MyMessageBatch();
+        var messages = new List<object>();
 
-            var messages = new List<object>();
+        var system = new ActorSystem();
 
-            var system = new ActorSystem();
-            var props = Props.FromFunc(ctx => {
-                    if (ctx.Message is string str)
-                    {
-                        messages.Add(str);
-                    }
-
-                    return Task.CompletedTask;
+        var props = Props.FromFunc(ctx =>
+            {
+                if (ctx.Message is string str)
+                {
+                    messages.Add(str);
                 }
-            );
 
-            var pid = system.Root.Spawn(props);
-            system.Root.Send(pid, batch);
-            await system.Root.PoisonAsync(pid);
+                return Task.CompletedTask;
+            }
+        );
 
-            var expected = new[] {"hello", "world", "batch"};
-            messages.Should().ContainInOrder(expected);
-        }
+        var pid = system.Root.Spawn(props);
+        system.Root.Send(pid, batch);
+        await system.Root.PoisonAsync(pid);
+
+        var expected = new[] { "hello", "world", "batch" };
+        messages.Should().ContainInOrder(expected);
+    }
+
+    private class MyMessageBatch : IMessageBatch
+    {
+        public IReadOnlyCollection<object> GetMessages() => new[] { "hello", "world", "batch" };
     }
 }

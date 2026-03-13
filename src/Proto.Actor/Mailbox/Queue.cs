@@ -1,18 +1,18 @@
 ﻿// -----------------------------------------------------------------------
 // <copyright file="Queue.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
-namespace Proto.Mailbox
+
+namespace Proto.Mailbox;
+
+public interface IMailboxQueue
 {
-    public interface IMailboxQueue
-    {
-        bool HasMessages { get; }
+    bool HasMessages { get; }
 
-        int Length { get; }
+    int Length { get; }
 
-        void Push(object message);
+    void Push(object message);
 
-        object? Pop();
-    }
+    object? Pop();
 }

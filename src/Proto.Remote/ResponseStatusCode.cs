@@ -1,11 +1,8 @@
-﻿namespace Proto.Remote
+﻿namespace Proto.Remote;
+
+public enum ResponseStatusCode
 {
-    public enum ResponseStatusCode
-    {
-        OK,
-        Unavailable,
-        Timeout,
-        ProcessNameAlreadyExist,
-        Error
-    }
+    OK,
+    ProcessNameAlreadyExist,
+    Error
 }

@@ -1,62 +1,73 @@
 // -----------------------------------------------------------------------
 //   <copyright file="RemoteProcess.cs" company="Asynkron AB">
-//       Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//       Copyright (C) 2015-2025 Asynkron AB All rights reserved
 //   </copyright>
 // -----------------------------------------------------------------------
 
-namespace Proto.Remote
+using System.Diagnostics;
+using Proto.Mailbox;
+
+namespace Proto.Remote;
+
+public class RemoteProcess : Process
 {
-    public class RemoteProcess : Process
+    private readonly EndpointManager _endpointManager;
+    private readonly string? _systemId;
+    private IRemoteEndpoint? _endpoint;
+
+    public RemoteProcess(ActorSystem system, EndpointManager endpointManager, PID pid) : base(system)
     {
-        private readonly EndpointManager _endpointManager;
-        private readonly PID _pid;
-        private PID? _endpoint;
+        _endpointManager = endpointManager;
+        pid.TryGetSystemId(system, out _systemId);
+        LastUsedTick = Stopwatch.GetTimestamp();
+    }
 
-        public RemoteProcess(ActorSystem system, EndpointManager endpointManager, PID pid) : base(system)
+    internal long LastUsedTick { get; private set; }
+
+    protected internal override void SendUserMessage(PID pid, object message) => Send(pid, message);
+
+    protected internal override void SendSystemMessage(PID pid, SystemMessage message) => Send(pid, message);
+
+    private void Send(PID pid, object msg)
+    {
+        var endpoint = GetEndpoint(pid);
+
+        // If the target endpoint is down or blocked, we get a BlockedEndpoint instance
+        switch (msg)
         {
-            _endpointManager = endpointManager;
-            _pid = pid;
+            case Watch w:
+                endpoint.RemoteWatch(pid, w);
+
+                break;
+            case Unwatch uw:
+                endpoint.RemoteUnwatch(pid, uw);
+
+                break;
+            default:
+                endpoint.SendMessage(pid, msg);
+
+                break;
         }
 
-        protected override void SendUserMessage(PID _, object message) => Send(message);
+        LastUsedTick = Stopwatch.GetTimestamp();
+    }
 
-        protected override void SendSystemMessage(PID _, object message) => Send(message);
-
-        private void Send(object msg)
+    private IRemoteEndpoint GetEndpoint(PID pid)
+    {
+        if (_endpoint?.IsActive == true)
         {
-            object message;
-            _endpoint ??= _endpointManager.GetEndpoint(_pid.Address);
-
-            switch (msg)
-            {
-                case Watch w:
-                    if (_endpoint is null)
-                    {
-                        System.Root.Send(w.Watcher, new Terminated {Why = TerminatedReason.AddressTerminated, Who = _pid});
-                        return;
-                    }
-
-                    message = new RemoteWatch(w.Watcher, _pid);
-                    break;
-                case Unwatch uw:
-                    if (_endpoint is null) return;
-
-                    message = new RemoteUnwatch(uw.Watcher, _pid);
-                    break;
-                default:
-                    var (m, sender, header) = Proto.MessageEnvelope.Unwrap(msg);
-
-                    if (_endpoint is null)
-                    {
-                        System.EventStream.Publish(new DeadLetterEvent(_pid, m, sender));
-                        return;
-                    }
-
-                    message = new RemoteDeliver(header!, m, _pid, sender!, -1);
-                    break;
-            }
-
-            System.Root.Send(_endpoint, message);
+            return _endpoint;
         }
+
+        if (_systemId != null)
+        {
+            _endpoint = null;
+
+            return _endpointManager.GetClientEndpoint(_systemId);
+        }
+
+        _endpoint = _endpointManager.GetOrAddServerEndpoint(pid.Address);
+
+        return _endpoint;
     }
 }

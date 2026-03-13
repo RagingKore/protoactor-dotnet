@@ -1,6 +1,6 @@
 ﻿// -----------------------------------------------------------------------
-//   <copyright file="Activator.cs" company="Asynkron AB">
-//       Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//   <copyright file="IdentityStoragePlacementActor.cs" company="Asynkron AB">
+//       Copyright (C) 2015-2025 Asynkron AB All rights reserved
 //   </copyright>
 // -----------------------------------------------------------------------
 
@@ -13,171 +13,228 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Proto.Cluster.Metrics;
 
-namespace Proto.Cluster.Identity
+namespace Proto.Cluster.Identity;
+
+internal class IdentityStoragePlacementActor : IActor
 {
-    class IdentityStoragePlacementActor : IActor
+    private const int PersistenceRetries = 3;
+#pragma warning disable CS0618 // Type or member is obsolete
+    private static readonly ILogger Logger = Log.CreateLogger<IdentityStoragePlacementActor>();
+#pragma warning restore CS0618 // Type or member is obsolete
+
+    //pid -> the actor that we have created here
+    //kind -> the actor kind
+    //eventId -> the cluster wide eventId when this actor was created
+    private readonly Dictionary<ClusterIdentity, PID> _actors = new();
+    private readonly Cluster _cluster;
+
+    private readonly IdentityStorageLookup _identityLookup;
+    private readonly HashSet<ClusterIdentity> _inFlightIdentityChecks = new();
+    private EventStreamSubscription<object>? _subscription;
+
+    public IdentityStoragePlacementActor(Cluster cluster, IdentityStorageLookup identityLookup)
     {
-        private const int PersistenceRetries = 3;
-        private readonly Cluster _cluster;
+        _cluster = cluster;
+        _identityLookup = identityLookup;
+    }
 
-        private readonly IdentityStorageLookup _identityLookup;
-        private readonly ILogger _logger;
-
-        //pid -> the actor that we have created here
-        //kind -> the actor kind
-        //eventId -> the cluster wide eventId when this actor was created
-        private readonly Dictionary<ClusterIdentity, PID> _myActors = new();
-        
-
-        public IdentityStoragePlacementActor(Cluster cluster, IdentityStorageLookup identityLookup)
+    public Task ReceiveAsync(IContext context) =>
+        context.Message switch
         {
-            _cluster = cluster;
-            _identityLookup = identityLookup;
-            _logger = Log.CreateLogger($"{nameof(IdentityStoragePlacementActor)}-{cluster.LoggerId}");
-        }
-
-        public Task ReceiveAsync(IContext context) => context.Message switch
-        {
-            Stopping _            => Stopping(context),
-            Stopped _             => Stopped(context),
-            Terminated msg        => Terminated(context, msg),
-            ActivationRequest msg => ActivationRequest(context, msg),
-            _                     => Task.CompletedTask
+            Started                   => OnStarted(context),
+            Stopping _                => Stopping(context),
+            Stopped _                 => Stopped(),
+            ActivationTerminating msg => OnActivationTerminating(context, msg),
+            ActivationRequest msg     => OnActivationRequest(context, msg),
+            _                         => Task.CompletedTask
         };
 
-        private Task Stopping(IContext context)
+    private Task OnStarted(IContext context)
+    {
+        _subscription = context.System.EventStream.Subscribe<ActivationTerminating>(e => context.Send(context.Self, e));
+
+        return Task.CompletedTask;
+    }
+
+    private async Task Stopping(IContext context)
+    {
+        Logger.LogInformation("Stopping placement actor");
+        _subscription?.Unsubscribe();
+        await _actors.Values.StopMany(context);
+    }
+
+    private Task Stopped()
+    {
+        Logger.LogDebug("Stopped placement actor");
+
+        return Task.CompletedTask;
+    }
+
+    private async Task OnActivationTerminating(IContext context, ActivationTerminating msg)
+    {
+        if (context.System.Shutdown.IsCancellationRequested)
         {
-            _logger.LogInformation("Stopping placement actor");
-            return Task.CompletedTask;
+            return;
         }
 
-        private Task Stopped(IContext context)
+        if (!_actors.TryGetValue(msg.ClusterIdentity, out var pid))
         {
-            _logger.LogInformation("Stopped placement actor");
-            return Task.CompletedTask;
+            Logger.LogWarning("Activation not found: {ActivationTerminating}", msg);
+
+            return;
         }
 
-        private async Task Terminated(IContext context, Terminated msg)
+        if (!pid.Equals(msg.Pid))
         {
-            if (context.System.Shutdown.IsCancellationRequested) return;
+            Logger.LogWarning("Activation did not match pid: {ActivationTerminating}, {Pid}", msg, pid);
 
-            var (identity, pid) = _myActors.FirstOrDefault(kvp => kvp.Value.Equals(msg.Who));
+            return;
+        }
 
-            if (identity != null && pid != null)
+        _actors.Remove(msg.ClusterIdentity);
+        _cluster.PidCache.RemoveByVal(msg.ClusterIdentity, pid);
+
+        try
+        {
+            await _identityLookup.RemovePidAsync(msg.ClusterIdentity, pid, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            Logger.LogError(e, "Failed to remove {Activation} from storage", pid);
+        }
+    }
+
+    private async Task OnActivationRequest(IContext context, ActivationRequest msg)
+    {
+        if (context.System.Metrics.Enabled)
+        {
+            IdentityMetrics.RecordActivationRequestReceived(context.System, msg.Kind);
+        }
+
+        if (_actors.TryGetValue(msg.ClusterIdentity, out var existing))
+        {
+            //this identity already exists
+            context.Respond(new ActivationResponse { Pid = existing });
+
+            return;
+        }
+
+        var clusterKind = _cluster.TryGetClusterKind(msg.Kind);
+
+        if (clusterKind is null)
+        {
+            Logger.LogError("Failed to spawn {Kind}/{Identity}, kind not found for member", msg.Kind, msg.Identity);
+            context.Respond(new ActivationResponse { Failed = true });
+
+            return;
+        }
+
+        if (clusterKind.CanSpawnIdentity is not null)
+        {
+            // Needs to check if the identity is allowed to spawn
+            await VerifyAndSpawn(msg, context, clusterKind).ConfigureAwait(false);
+        }
+        else
+        {
+            Spawn(msg, context, clusterKind);
+        }
+    }
+
+    private Task VerifyAndSpawn(ActivationRequest msg, IContext context, ActivatedClusterKind clusterKind) =>
+        SpawnVerificationHelper.VerifyAndSpawn(
+            msg, context, clusterKind, _cluster, _inFlightIdentityChecks, Spawn, Logger, "[PartitionIdentity]");
+
+    private void OnSpawnDecided(ActivationRequest msg, IContext context, ActivatedClusterKind clusterKind,
+        bool canSpawnIdentity) =>
+        SpawnVerificationHelper.OnSpawnDecided(msg, context, clusterKind, canSpawnIdentity, Spawn);
+
+    private void Spawn(ActivationRequest msg, IContext context, ActivatedClusterKind clusterKind)
+    {
+        try
+        {
+            var sw = Stopwatch.StartNew();
+
+            var pid = context.SpawnPrefix(clusterKind.Props, msg.ClusterIdentity.Identity,
+                ctx => ctx.Set(msg.ClusterIdentity));
+
+            sw.Stop();
+
+            if (_cluster.System.Metrics.Enabled)
             {
-                _myActors.Remove(identity);
-                _cluster.PidCache.RemoveByVal(identity, pid);
-
-                try
-                {
-                    await _identityLookup.RemovePidAsync(identity, msg.Who, CancellationToken.None);
-                }
-                catch (Exception e)
-                {
-                    _logger.LogError(e, "Failed to remove {Activation} from storage", pid);
-                }
+                ClusterMetrics.ClusterActorSpawnDuration
+                    .Record(sw.Elapsed.TotalSeconds,
+                        new KeyValuePair<string, object?>("id", _cluster.System.Id),
+                        new KeyValuePair<string, object?>("address", _cluster.System.Address),
+                        new KeyValuePair<string, object?>("clusterkind", msg.Kind)
+                    );
             }
-        }
 
-        private Task ActivationRequest(IContext context, ActivationRequest msg)
+            //Do not expose the PID externally before we have persisted the activation
+            var completionCallback = new TaskCompletionSource<PID?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            context.ReenterAfter(Task.Run(() => PersistActivation(context, msg, pid)), persistResult =>
+                {
+                    var wasPersistedCorrectly = persistResult.Result;
+
+                    if (wasPersistedCorrectly)
+                    {
+                        _actors[msg.ClusterIdentity] = pid;
+                        _cluster.PidCache.TryAdd(msg.ClusterIdentity, pid);
+                        completionCallback.SetResult(pid);
+                        context.Respond(new ActivationResponse { Pid = pid });
+                    }
+                    else // Not stored, kill it and retry later?
+                    {
+                        context.Respond(new ActivationResponse { Failed = true });
+                        context.Poison(pid);
+                        completionCallback.SetResult(null);
+                    }
+
+                    return Task.CompletedTask;
+                }
+            );
+        }
+        catch (Exception e)
+        {
+            Logger.LogError(e, "Failed to spawn {Kind}/{Identity}", msg.Kind, msg.Identity);
+            context.Respond(new ActivationResponse { Failed = true });
+        }
+    }
+
+    private async Task<bool> PersistActivation(IContext context, ActivationRequest msg, PID pid)
+    {
+        var attempts = 0;
+        var spawnLock = new SpawnLock(msg.RequestId, msg.ClusterIdentity);
+
+        while (true)
         {
             try
             {
-                if (_myActors.TryGetValue(msg.ClusterIdentity, out var existing))
-                {
-                    //this identity already exists
-                    Respond(existing);
-                }
-                else
-                {
-                    var clusterKind = _cluster.GetClusterKind(msg.Kind);
-                    //this actor did not exist, lets spawn a new activation
+                await _identityLookup.Storage.StoreActivation(_cluster.System.Id, spawnLock, pid,
+                    context.CancellationToken
+                ).ConfigureAwait(false);
 
-                    //spawn and remember this actor
-                    //as this id is unique for this activation (id+counter)
-                    //we cannot get ProcessNameAlreadyExists exception here
-                    var clusterProps = clusterKind.Props.WithClusterIdentity(msg.ClusterIdentity);
+                return true;
+            }
+            catch (LockNotFoundException)
+            {
+                Logger.LogWarning("We no longer own the lock {@SpawnLock}", spawnLock);
 
-                    var sw = Stopwatch.StartNew();
-                    var pid = context.SpawnPrefix(clusterProps, msg.ClusterIdentity.ToString());
-                    context.System.Metrics.Get<ClusterMetrics>().ClusterActorSpawnHistogram
-                        .Observe(sw, new[] {_cluster.System.Id, _cluster.System.Address, msg.Kind});
-                    sw.Stop();
-
-                    //Do not expose the PID externally before we have persisted the activation
-                    var completionCallback = new TaskCompletionSource<PID?>();
-
-                    context.ReenterAfter(Task.Run(() => PersistActivation(context, msg, pid)), persistResult => {
-                            var wasPersistedCorrectly = persistResult.Result;
-
-                            if (wasPersistedCorrectly)
-                            {
-                                _myActors[msg.ClusterIdentity] = pid;
-                                _cluster.PidCache.TryAdd(msg.ClusterIdentity, pid);
-                                completionCallback.SetResult(pid);
-                                Respond(pid);
-                            }
-                            else // Not stored, kill it and retry later?
-                            {
-                                Respond(null);
-                                context.Poison(pid);
-                                completionCallback.SetResult(null);
-                            }
-
-                            return Task.CompletedTask;
-                        }
-                    );
-                }
+                return false;
             }
             catch (Exception e)
             {
-                _logger.LogError(e, "Failed to spawn {Kind}/{Identity}", msg.Kind, msg.Identity);
-                Respond(null);
-            }
-
-            return Task.CompletedTask;
-
-            void Respond(PID? result)
-            {
-                var response = new ActivationResponse
+                if (++attempts < PersistenceRetries)
                 {
-                    Pid = result
-                };
-                context.Respond(response);
-            }
-        }
-
-        private async Task<bool> PersistActivation(IContext context, ActivationRequest msg, PID pid)
-        {
-            var attempts = 0;
-            var spawnLock = new SpawnLock(msg.RequestId, msg.ClusterIdentity);
-
-            while (true)
-            {
-                try
-                {
-                    await _identityLookup.Storage.StoreActivation(_cluster.System.Id, spawnLock, pid,
-                        context.CancellationToken
-                    );
-                    return true;
+                    Logger.LogWarning(e, "No entry was updated {@SpawnLock}. Retrying", spawnLock);
+                    // Give storage a moment before retrying to store the activation
+                    await Task.Delay(50).ConfigureAwait(false);
                 }
-                catch (LockNotFoundException)
+                else
                 {
-                    _logger.LogError("We no longer own the lock {@SpawnLock}", spawnLock);
+                    Logger.LogError(e, "Failed to persist activation: {@SpawnLock}", spawnLock);
+
                     return false;
-                }
-                catch (Exception e)
-                {
-                    if (++attempts < PersistenceRetries)
-                    {
-                        _logger.LogWarning(e, "No entry was updated {@SpawnLock}. Retrying.", spawnLock);
-                        await Task.Delay(50);
-                    }
-                    else
-                    {
-                        _logger.LogError(e, "Failed to persist activation: {@SpawnLock}", spawnLock);
-                        return false;
-                    }
                 }
             }
         }

@@ -1,321 +1,535 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using Marten;
+using Microsoft.Data.Sqlite;
+using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
+using MongoDB.Bson.Serialization.Serializers;
+using MongoDB.Driver;
+using Proto.Persistence.Marten;
+using Proto.Persistence.MongoDB;
+using Proto.Persistence.Sqlite;
+using Proto.Persistence.SqlServer;
 using Proto.TestFixtures;
 using Xunit;
 
-namespace Proto.Persistence.Tests
+namespace Proto.Persistence.Tests;
+
+
+
+public class ExamplePersistentActorTests: IClassFixture<ContainersFixture>
 {
-    public class ExamplePersistentActorTests
+    private const int InitialState = 1;
+
+    
+    private readonly ContainersFixture _fixture;
+
+    public ExamplePersistentActorTests(ContainersFixture fixture)
     {
-        private const int InitialState = 1;
-        private static readonly RootContext Context = new(new ActorSystem());
-
-        [Fact]
-        public async void EventsAreSavedToPersistence()
-        {
-            var (pid, _, actorId, providerState) = CreateTestActor();
-            Context.Send(pid, new Multiply {Amount = 2});
-            await providerState
-                .GetEventsAsync(actorId, 0, long.MaxValue, o => {
-                        Assert.IsType<Multiplied>(o);
-                        Assert.Equal(2, ((Multiplied) o).Amount);
-                    }
-                );
-        }
-
-        [Fact]
-        public async void SnapshotsAreSavedToPersistence()
-        {
-            var (pid, _, actorId, providerState) = CreateTestActor();
-            Context.Send(pid, new Multiply {Amount = 10});
-            Context.Send(pid, new RequestSnapshot());
-            var (snapshot, _) = await providerState.GetSnapshotAsync(actorId);
-            var snapshotState = snapshot as State;
-            Assert.Equal(10, snapshotState.Value);
-        }
-
-        [Fact]
-        public async void EventsCanBeDeleted()
-        {
-            var (pid, _, actorId, providerState) = CreateTestActor();
-            Context.Send(pid, new Multiply {Amount = 10});
-            await providerState.DeleteEventsAsync(actorId, 1);
-            var events = new List<object>();
-            await providerState.GetEventsAsync(actorId, 0, long.MaxValue, v => events.Add(v));
-
-            Assert.Empty(events);
-        }
-
-        [Fact]
-        public async void SnapshotsCanBeDeleted()
-        {
-            var (pid, _, actorId, providerState) = CreateTestActor();
-            Context.Send(pid, new Multiply {Amount = 10});
-            Context.Send(pid, new RequestSnapshot());
-            await providerState.DeleteSnapshotsAsync(actorId, 1);
-            var (snapshot, _) = await providerState.GetSnapshotAsync(actorId);
-            Assert.Null(snapshot);
-        }
-
-        [Fact]
-        public async void GivenEventsOnly_StateIsRestoredFromEvents()
-        {
-            var (pid, props, _, _) = CreateTestActor();
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new Multiply {Amount = 2});
-            var state = await RestartActorAndGetState(pid, props);
-            Assert.Equal(InitialState * 2 * 2, state);
-        }
-
-        [Fact]
-        public async void GivenASnapshotOnly_StateIsRestoredFromTheSnapshot()
-        {
-            var (pid, props, actorId, providerState) = CreateTestActor();
-            await providerState.PersistSnapshotAsync(actorId, 0, new State {Value = 10});
-            var state = await RestartActorAndGetState(pid, props);
-            Assert.Equal(10, state);
-        }
-
-        [Fact]
-        public async void GivenEventsThenASnapshot_StateShouldBeRestoredFromTheSnapshot()
-        {
-            var (pid, props, _, _) = CreateTestActor();
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new RequestSnapshot());
-            var state = await RestartActorAndGetState(pid, props);
-            var expectedState = InitialState * 2 * 2;
-            Assert.Equal(expectedState, state);
-        }
-
-        [Fact]
-        public async void GivenASnapshotAndSubsequentEvents_StateShouldBeRestoredFromSnapshotAndSubsequentEvents()
-        {
-            var (pid, props, _, _) = CreateTestActor();
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new RequestSnapshot());
-            Context.Send(pid, new Multiply {Amount = 4});
-            Context.Send(pid, new Multiply {Amount = 8});
-            var state = await RestartActorAndGetState(pid, props);
-            var expectedState = InitialState * 2 * 2 * 4 * 8;
-            Assert.Equal(expectedState, state);
-        }
-
-        [Fact]
-        public async void GivenMultipleSnapshots_StateIsRestoredFromMostRecentSnapshot()
-        {
-            var (pid, props, actorId, providerState) = CreateTestActor();
-
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new RequestSnapshot());
-            Context.Send(pid, new Multiply {Amount = 4});
-            Context.Send(pid, new RequestSnapshot());
-            await providerState.DeleteEventsAsync(actorId, 2); // just to be sure state isn't recovered from events
-            var state = await RestartActorAndGetState(pid, props);
-            Assert.Equal(InitialState * 2 * 4, state);
-        }
-
-        [Fact]
-        public async void GivenMultipleSnapshots_DeleteSnapshotObeysIndex()
-        {
-            var (pid, props, actorId, providerState) = CreateTestActor();
-
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new RequestSnapshot());
-            Context.Send(pid, new Multiply {Amount = 4});
-            Context.Send(pid, new RequestSnapshot());
-            await providerState.DeleteSnapshotsAsync(actorId, 0);
-            await providerState.DeleteEventsAsync(actorId, 1);
-            var state = await RestartActorAndGetState(pid, props);
-            var expectedState = InitialState * 2 * 4;
-            Assert.Equal(expectedState, state);
-        }
-
-        [Fact]
-        public async void GivenASnapshotAndEvents_WhenSnapshotDeleted_StateShouldBeRestoredFromEvents()
-        {
-            var (pid, props, actorId, providerState) = CreateTestActor();
-
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new RequestSnapshot());
-            Context.Send(pid, new Multiply {Amount = 4});
-            Context.Send(pid, new Multiply {Amount = 8});
-            await providerState.DeleteSnapshotsAsync(actorId, 3);
-
-            var state = await RestartActorAndGetState(pid, props);
-            Assert.Equal(InitialState * 2 * 2 * 4 * 8, state);
-        }
-
-        [Fact]
-        public async void Index_IncrementsOnEventsSaved()
-        {
-            var (pid, _, _, _) = CreateTestActor();
-
-            Context.Send(pid, new Multiply {Amount = 2});
-            var index = await Context.RequestAsync<long>(pid, new GetIndex(), TimeSpan.FromSeconds(1));
-            Assert.Equal(0, index);
-            Context.Send(pid, new Multiply {Amount = 4});
-            index = await Context.RequestAsync<long>(pid, new GetIndex(), TimeSpan.FromSeconds(1));
-            Assert.Equal(1, index);
-        }
-
-        [Fact]
-        public async void Index_IsNotAffectedByTakingASnapshot()
-        {
-            var (pid, _, _, _) = CreateTestActor();
-
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new RequestSnapshot());
-            Context.Send(pid, new Multiply {Amount = 4});
-            var index = await Context.RequestAsync<long>(pid, new GetIndex(), TimeSpan.FromSeconds(1));
-            Assert.Equal(1, index);
-        }
-
-        [Fact]
-        public async void Index_IsCorrectAfterRecovery()
-        {
-            var (pid, props, _, _) = CreateTestActor();
-
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new Multiply {Amount = 4});
-
-            await Context.StopAsync(pid);
-            pid = Context.Spawn(props);
-            var state = await Context.RequestAsync<int>(pid, new GetState(), TimeSpan.FromSeconds(1));
-            var index = await Context.RequestAsync<long>(pid, new GetIndex(), TimeSpan.FromSeconds(1));
-            Assert.Equal(1, index);
-            Assert.Equal(InitialState * 2 * 4, state);
-        }
-
-        [Fact]
-        public async void GivenEvents_CanReplayFromStartIndexToEndIndex()
-        {
-            var (pid, _, actorId, providerState) = CreateTestActor();
-
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new Multiply {Amount = 2});
-            Context.Send(pid, new Multiply {Amount = 4});
-            Context.Send(pid, new Multiply {Amount = 8});
-            var messages = new List<object>();
-            await providerState.GetEventsAsync(actorId, 1, 2, msg => messages.Add(msg));
-            Assert.Equal(2, messages.Count);
-            Assert.Equal(2, ((Multiplied) messages[0]).Amount);
-            Assert.Equal(4, ((Multiplied) messages[1]).Amount);
-        }
-
-        [Fact]
-        public async Task CanUseSeparateStores()
-        {
-            var actorId = Guid.NewGuid().ToString();
-            var eventStore = new InMemoryProvider();
-            var snapshotStore = new InMemoryProvider();
-            var props = Props.FromProducer(() => new ExamplePersistentActor(eventStore, snapshotStore, actorId))
-                .WithMailbox(() => new TestMailbox());
-            var pid = Context.Spawn(props);
-
-            Context.Send(pid, new Multiply {Amount = 2});
-            var eventStoreMessages = new List<object>();
-            var snapshotStoreMessages = new List<object>();
-            await eventStore.GetEventsAsync(actorId, 0, 1, msg => eventStoreMessages.Add(msg));
-            Assert.Single(eventStoreMessages);
-            await snapshotStore.GetEventsAsync(actorId, 0, 1, msg => snapshotStoreMessages.Add(msg));
-            Assert.Empty(snapshotStoreMessages);
-        }
-
-        private (PID pid, Props props, string actorId, IProvider provider) CreateTestActor()
-        {
-            var actorId = Guid.NewGuid().ToString();
-            var inMemoryProvider = new InMemoryProvider();
-            var props = Props
-                .FromProducer(() => new ExamplePersistentActor(inMemoryProvider, inMemoryProvider, actorId))
-                .WithMailbox(() => new TestMailbox());
-            var pid = Context.Spawn(props);
-            return (pid, props, actorId, inMemoryProvider);
-        }
-
-        private async Task<int> RestartActorAndGetState(PID pid, Props props)
-        {
-            await Context.StopAsync(pid);
-            pid = Context.Spawn(props);
-            return await Context.RequestAsync<int>(pid, new GetState(), TimeSpan.FromMilliseconds(500));
-        }
+        _fixture = fixture;
     }
 
-    class State
+    private IProvider GetProvider(TestProvider providerType)
     {
-        public int Value { get; set; }
+        switch (providerType)
+        {
+            case TestProvider.InMemory:
+                return new InMemoryProvider();
+            case TestProvider.Marten:
+                return new MartenProvider(DocumentStore.For(_fixture.Postgres.GetConnectionString()));
+            case TestProvider.Sqlite:
+                return new SqliteProvider(
+                    new SqliteConnectionStringBuilder($"Data Source=file:{Guid.NewGuid()}?mode=memory"));
+            case TestProvider.SqlServer:
+                return new SqlServerProvider(_fixture.MsSql.GetConnectionString(), true);
+            case TestProvider.MongoDb:
+                try
+                {
+                    ObjectSerializer objectSerializer = new ObjectSerializer(type => 
+                        ObjectSerializer.DefaultAllowedTypes(type) || type.FullName.StartsWith("Proto.Persistence.Tests"));
+        
+                    BsonSerializer.RegisterSerializer(objectSerializer);
+                }
+                catch (BsonSerializationException e)
+                {
+                }
+                return new MongoDBProvider(new MongoClient(_fixture.MongoDb.GetConnectionString())
+                    .GetDatabase("Test"));
+            default:
+                throw new ArgumentOutOfRangeException(nameof(providerType), providerType, null);
+        }
+    }
+    
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+   
+    public async Task EventsAreSavedToPersistence(TestProvider testProvider)
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, _, actorId, providerState) = CreateTestActor(context,provider);
+        context.Send(pid, new Multiply { Amount = 2 });
+
+        await providerState
+            .GetEventsAsync(actorId, 0, long.MaxValue, o =>
+                {
+                    Assert.IsType<Multiplied>(o);
+                    Assert.Equal(2, ((Multiplied)o).Amount);
+                }
+            );
     }
 
-    class GetState
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task SnapshotsAreSavedToPersistence(TestProvider testProvider)
     {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, _, actorId, providerState) = CreateTestActor(context,provider);
+        context.Send(pid, new Multiply { Amount = 10 });
+        context.Send(pid, new RequestSnapshot());
+        var (snapshot, _) = await providerState.GetSnapshotAsync(actorId);
+        var snapshotState = snapshot as State;
+        Assert.NotNull(snapshotState?.Value);
+        Assert.Equal(10, snapshotState?.Value);
     }
 
-    class GetIndex
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task EventsCanBeDeleted(TestProvider testProvider)
     {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, _, actorId, providerState) = CreateTestActor(context,provider);
+        context.Send(pid, new Multiply { Amount = 10 });
+        await providerState.DeleteEventsAsync(actorId, 1);
+        var events = new List<object>();
+        await providerState.GetEventsAsync(actorId, 0, long.MaxValue, v => events.Add(v));
+
+        Assert.Empty(events);
     }
 
-    class Multiply
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task SnapshotsCanBeDeleted(TestProvider testProvider)
     {
-        public int Amount { get; set; }
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, _, actorId, providerState) = CreateTestActor(context,  provider);
+        context.Send(pid, new Multiply { Amount = 10 });
+        context.Send(pid, new RequestSnapshot());
+        await providerState.DeleteSnapshotsAsync(actorId, 1);
+        var (snapshot, _) = await providerState.GetSnapshotAsync(actorId);
+        Assert.Null(snapshot);
     }
 
-    class Multiplied
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task GivenEventsOnly_StateIsRestoredFromEvents(TestProvider testProvider)
     {
-        public int Amount { get; set; }
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, props, _, _) = CreateTestActor(context,provider);
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new Multiply { Amount = 2 });
+        var state = await RestartActorAndGetState(pid, props, context);
+        Assert.Equal(InitialState * 2 * 2, state);
     }
 
-    class RequestSnapshot
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task GivenASnapshotOnly_StateIsRestoredFromTheSnapshot(TestProvider testProvider)
     {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, props, actorId, providerState) = CreateTestActor(context,provider);
+        await providerState.PersistSnapshotAsync(actorId, 0, new State { Value = 10 });
+        var state = await RestartActorAndGetState(pid, props, context);
+        Assert.Equal(10, state);
     }
 
-    class ExamplePersistentActor : IActor
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    
+    public async Task GivenEventsThenASnapshot_StateShouldBeRestoredFromTheSnapshot(TestProvider  testProvider)
     {
-        private readonly Persistence _persistence;
-        private State _state = new() {Value = 1};
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, props, _, _) = CreateTestActor(context,provider);
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new RequestSnapshot());
+        var state = await RestartActorAndGetState(pid, props, context);
+        var expectedState = InitialState * 2 * 2;
+        Assert.Equal(expectedState, state);
+    }
 
-        public ExamplePersistentActor(IEventStore eventStore, ISnapshotStore snapshotStore, string persistenceId) => _persistence =
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task GivenASnapshotAndSubsequentEvents_StateShouldBeRestoredFromSnapshotAndSubsequentEvents( TestProvider testProvider)
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, props, _, _) = CreateTestActor(context,provider);
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new RequestSnapshot());
+        context.Send(pid, new Multiply { Amount = 4 });
+        context.Send(pid, new Multiply { Amount = 8 });
+        var state = await RestartActorAndGetState(pid, props, context);
+        var expectedState = InitialState * 2 * 2 * 4 * 8;
+        Assert.Equal(expectedState, state);
+    }
+
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task GivenMultipleSnapshots_StateIsRestoredFromMostRecentSnapshot(TestProvider testProvider)
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, props, actorId, providerState) = CreateTestActor(context,provider);
+
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new RequestSnapshot());
+        context.Send(pid, new Multiply { Amount = 4 });
+        context.Send(pid, new RequestSnapshot());
+        await providerState.DeleteEventsAsync(actorId, 2); // just to be sure state isn't recovered from events
+        var state = await RestartActorAndGetState(pid, props, context);
+        Assert.Equal(InitialState * 2 * 4, state);
+    }
+
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task GivenMultipleSnapshots_DeleteSnapshotObeysIndex(TestProvider testProvider)
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, props, actorId, providerState) = CreateTestActor(context,provider);
+
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new RequestSnapshot());
+        context.Send(pid, new Multiply { Amount = 4 });
+        context.Send(pid, new RequestSnapshot());
+        await providerState.DeleteSnapshotsAsync(actorId, 0);
+        await providerState.DeleteEventsAsync(actorId, 1);
+        var state = await RestartActorAndGetState(pid, props, context);
+        var expectedState = InitialState * 2 * 4;
+        Assert.Equal(expectedState, state);
+    }
+
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task GivenASnapshotAndEvents_WhenSnapshotDeleted_StateShouldBeRestoredFromEvents(TestProvider testProvider)
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, props, actorId, providerState) = CreateTestActor(context,provider);
+
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new RequestSnapshot());
+        context.Send(pid, new Multiply { Amount = 4 });
+        context.Send(pid, new Multiply { Amount = 8 });
+        await providerState.DeleteSnapshotsAsync(actorId, 3);
+
+        var state = await RestartActorAndGetState(pid, props, context);
+        Assert.Equal(InitialState * 2 * 2 * 4 * 8, state);
+    }
+
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task Index_IncrementsOnEventsSaved(TestProvider  testProvider)
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, _, _, _) = CreateTestActor(context,provider);
+
+        context.Send(pid, new Multiply { Amount = 2 });
+        var index = await context.RequestAsync<long>(pid, new GetIndex(), TimeSpan.FromSeconds(1));
+        Assert.Equal(0, index);
+        context.Send(pid, new Multiply { Amount = 4 });
+        index = await context.RequestAsync<long>(pid, new GetIndex(), TimeSpan.FromSeconds(1));
+        Assert.Equal(1, index);
+    }
+
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task Index_IsIncrementedByTakingASnapshot(TestProvider testProvider)
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, _, _, _) = CreateTestActor(context,provider);
+
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new RequestSnapshot());
+        context.Send(pid, new Multiply { Amount = 4 });
+        var index = await context.RequestAsync<long>(pid, new GetIndex(), TimeSpan.FromSeconds(1));
+        Assert.Equal(2, index);
+    }
+
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task Index_IsCorrectAfterRecovery(TestProvider testProvider)
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, props, _, _) = CreateTestActor(context,provider);
+
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new Multiply { Amount = 4 });
+
+        await context.StopAsync(pid);
+        pid = context.Spawn(props);
+        var state = await context.RequestAsync<int>(pid, new GetState(), TimeSpan.FromSeconds(1));
+        var index = await context.RequestAsync<long>(pid, new GetIndex(), TimeSpan.FromSeconds(1));
+        Assert.Equal(1, index);
+        Assert.Equal(InitialState * 2 * 4, state);
+    }
+
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task GivenEvents_CanReplayFromStartIndexToEndIndex(TestProvider testProvider)
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+        var provider = GetProvider(testProvider);
+        var (pid, _, actorId, providerState) = CreateTestActor(context,provider);
+
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new Multiply { Amount = 2 });
+        context.Send(pid, new Multiply { Amount = 4 });
+        context.Send(pid, new Multiply { Amount = 8 });
+        var messages = new List<object>();
+        await providerState.GetEventsAsync(actorId, 1, 2, msg => messages.Add(msg));
+        Assert.Equal(2, messages.Count);
+        Assert.Equal(2, ((Multiplied)messages[0]).Amount);
+        Assert.Equal(4, ((Multiplied)messages[1]).Amount);
+    }
+
+    [Theory]
+    [InlineData(TestProvider.InMemory)]
+    [InlineData(TestProvider.Sqlite)]
+    [InlineData(TestProvider.Marten)]
+    [InlineData(TestProvider.SqlServer)]
+    [InlineData(TestProvider.MongoDb)]
+    public async Task CanUseSeparateStores(TestProvider  testProvider)
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+
+        var actorId = Guid.NewGuid().ToString();
+        var eventStore = GetProvider(testProvider);
+        var snapshotStore = GetProvider(testProvider);
+
+        var props = Props.FromProducer(() => new ExamplePersistentActor(eventStore, snapshotStore, actorId));
+
+        var pid = context.Spawn(props);
+
+        context.Send(pid, new Multiply { Amount = 2 });
+        _ = await context.RequestAsync<int>(pid, new GetState(), TimeSpan.FromSeconds(5));
+        var eventStoreMessages = new List<object>();
+        var snapshotStoreMessages = new List<object>();
+        await eventStore.GetEventsAsync(actorId, 0, 1, msg => eventStoreMessages.Add(msg));
+        Assert.Single(eventStoreMessages);
+        await snapshotStore.GetEventsAsync(actorId, 0, 1, msg => snapshotStoreMessages.Add(msg));
+        Assert.Empty(snapshotStoreMessages);
+    }
+
+    private (PID pid, Props props, string actorId, IProvider provider) CreateTestActor(IRootContext context,IProvider provider)
+    {
+        var actorId = Guid.NewGuid().ToString();
+       
+
+        var props = Props
+            .FromProducer(() => new ExamplePersistentActor(provider, provider, actorId));
+
+        var pid = context.Spawn(props);
+
+        return (pid, props, actorId, provider);
+    }
+
+    private async Task<int> RestartActorAndGetState(PID pid, Props props, IRootContext context)
+    {
+        await context.StopAsync(pid);
+        pid = context.Spawn(props);
+
+        return await context.RequestAsync<int>(pid, new GetState(), TimeSpan.FromMilliseconds(500));
+    }
+
+   
+
+}
+
+
+internal class State
+{
+    public int Value { get; set; }
+}
+
+public enum TestProvider
+{
+    InMemory=1,
+    Couchbase=2,
+    Marten=3,
+    MongoDb=4,
+    RavenDb=5,
+    Sqlite=6,
+    SqlServer=7,
+    DynamoDb
+}
+internal class GetState
+{
+}
+
+internal class GetIndex
+{
+}
+
+internal class Multiply
+{
+    public int Amount { get; set; }
+}
+
+internal class Multiplied
+{
+    public int Amount { get; set; }
+}
+
+internal class RequestSnapshot
+{
+}
+
+internal class ExamplePersistentActor : IActor
+{
+    private readonly Persistence _persistence;
+    private State _state = new() { Value = 1 };
+
+    public ExamplePersistentActor(IEventStore eventStore, ISnapshotStore snapshotStore, string persistenceId)
+    {
+        _persistence =
             Persistence.WithEventSourcingAndSnapshotting(eventStore, snapshotStore, persistenceId,
                 ApplyEvent, ApplySnapshot
             );
+    }
 
-        public async Task ReceiveAsync(IContext context)
+    public async Task ReceiveAsync(IContext context)
+    {
+        switch (context.Message)
         {
-            switch (context.Message)
-            {
-                case Started _:
-                    await _persistence.RecoverStateAsync();
-                    break;
-                case GetState _:
-                    context.Respond(_state.Value);
-                    break;
-                case GetIndex _:
-                    context.Respond(_persistence.Index);
-                    break;
-                case RequestSnapshot _:
-                    await _persistence.PersistSnapshotAsync(new State {Value = _state.Value});
-                    break;
-                case Multiply msg:
-                    await _persistence.PersistEventAsync(new Multiplied {Amount = msg.Amount});
-                    break;
-            }
+            case Started _:
+                await _persistence.RecoverStateAsync();
+
+                break;
+            case GetState _:
+                context.Respond(_state.Value);
+
+                break;
+            case GetIndex _:
+                context.Respond(_persistence.Index);
+
+                break;
+            case RequestSnapshot _:
+                await _persistence.PersistSnapshotAsync(new State { Value = _state.Value });
+
+                break;
+            case Multiply msg:
+                await _persistence.PersistEventAsync(new Multiplied { Amount = msg.Amount });
+
+                break;
         }
+    }
 
-        private void ApplyEvent(Event @event)
+    private void ApplyEvent(Event @event)
+    {
+        switch (@event.Data)
         {
-            switch (@event.Data)
-            {
-                case Multiplied msg:
-                    _state.Value = _state.Value * msg.Amount;
-                    break;
-            }
+            case Multiplied msg:
+                _state.Value = _state.Value * msg.Amount;
+
+                break;
         }
+    }
 
-        private void ApplySnapshot(Snapshot snapshot)
+    private void ApplySnapshot(Snapshot snapshot)
+    {
+        if (snapshot.State is State ss)
         {
-            if (snapshot.State is State ss) _state = ss;
+            _state = ss;
         }
     }
 }

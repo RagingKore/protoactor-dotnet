@@ -1,46 +1,58 @@
 ﻿using System;
+using System.Threading.Tasks;
 using Proto.TestFixtures;
 using Xunit;
 using static Proto.TestFixtures.Receivers;
 
-namespace Proto.Tests
+namespace Proto.Tests;
+
+public class PidTests
 {
-    public class PIDTests
+    [Fact]
+    public async Task Given_ActorNotDead_Ref_ShouldReturnIt()
     {
-        private static readonly ActorSystem System = new();
-        private static readonly RootContext Context = System.Root;
+        var system = new ActorSystem();
+        await using var _ = system;
+        var context = system.Root;
+        var pid = context.Spawn(Props.FromFunc(EmptyReceive));
 
-        [Fact]
-        public void Given_ActorNotDead_Ref_ShouldReturnIt()
-        {
-            var pid = Context.Spawn(Props.FromFunc(EmptyReceive));
+        var p = pid.Ref(system);
+        var p2 = pid.Ref(system);
 
-            var p = pid.Ref(System);
+        Assert.NotNull(p);
+        Assert.Same(p, p2);
+    }
 
-            Assert.NotNull(p);
-        }
+    [Fact]
+    public async Task Given_ActorDied_Ref_ShouldNotReturnIt()
+    {
+        var system = new ActorSystem();
+        await using var _ = system;
+        var context = system.Root;
 
-        [Fact]
-        public async void Given_ActorDied_Ref_ShouldNotReturnIt()
-        {
-            var pid = Context.Spawn(Props.FromFunc(EmptyReceive).WithMailbox(() => new TestMailbox()));
-            await Context.StopAsync(pid);
+        var pid = context.Spawn(Props.FromFunc(EmptyReceive));
+        await context.StopAsync(pid);
 
-            var p = pid.Ref(System);
+        var p = pid.Ref(system);
+        var p2 = pid.Ref(system);
 
-            Assert.Null(p);
-        }
+        Assert.Null(p);
+        Assert.Null(p2);
+    }
 
-        [Fact]
-        public void Given_OtherProcess_Ref_ShouldReturnIt()
-        {
-            var id = Guid.NewGuid().ToString();
-            var p = new TestProcess(System);
-            var (pid, _) = System.ProcessRegistry.TryAdd(id, p);
+    [Fact]
+    public async Task Given_OtherProcess_Ref_ShouldReturnIt()
+    {
+        var system = new ActorSystem();
+        await using var _ = system;
 
-            var p2 = pid.Ref(System);
+        var id = Guid.NewGuid().ToString();
+        var p = new TestProcess(system);
+        var (pid, _) = system.ProcessRegistry.TryAdd(id, p);
 
-            Assert.Same(p, p2);
-        }
+        var p2 = pid.Ref(system);
+
+        Assert.Same(p, p2);
+        Assert.Equal(id, pid.Id);
     }
 }

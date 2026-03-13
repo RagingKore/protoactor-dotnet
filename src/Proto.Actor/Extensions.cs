@@ -1,58 +1,74 @@
 ﻿// -----------------------------------------------------------------------
 // <copyright file="Extensions.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
 using System;
 using System.Collections.Generic;
-using System.Threading;
+using System.Linq;
+using System.Threading.Tasks;
 using JetBrains.Annotations;
 using Proto.Mailbox;
 
-namespace Proto
+namespace Proto;
+
+public static class UtilExtensions
 {
-    public static class CancellationTokens
+    internal static void SendSystemMessage(this IEnumerable<PID> self, SystemMessage message, ActorSystem system)
     {
-        public static CancellationToken WithTimeout(int ms) => new CancellationTokenSource(ms).Token;
-        public static CancellationToken WithTimeout(TimeSpan timeSpan) => new CancellationTokenSource(timeSpan).Token;
+        foreach (var pid in self)
+        {
+            pid.SendSystemMessage(system, message);
+        }
     }
 
-    public static class UtilExtensions
+    public static async Task StopMany(this IEnumerable<PID> self, IContext context)
     {
-        /// <summary>
-        ///     Stop the current actor
-        /// </summary>
-        /// <param name="self">The actor instance to stop</param>
-        /// <param name="system">Actor system</param>
-        internal static void Stop(this IEnumerable<PID> self, ActorSystem system)
+        foreach (var chunk in self.Chunk(20))
         {
-            if (self is null!) return;
-
-            foreach (var pid in self)
+            var tasks = chunk.Select(context.StopAsync);
+            try
             {
-                system.Root.Stop(pid);
+                await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(10));
             }
-        }
-
-        internal static void SendSystemMessage(this IEnumerable<PID> self, SystemMessage message, ActorSystem system)
-        {
-            foreach (var pid in self)
+            catch (TimeoutException)
             {
-                pid.SendSystemMessage(system, message);
+                // ignore timeout and continue stopping remaining actors
             }
-        }
-
-        [UsedImplicitly]
-        public static void Deconstruct<TKey, TValue>(
-            //DONT TOUCH THIS, it tries to deconstruct the deconstruct method...
-            // ReSharper disable once UseDeconstructionOnParameter
-            this KeyValuePair<TKey, TValue> self,
-            out TKey key,
-            out TValue value
-        )
-        {
-            key = self.Key;
-            value = self.Value;
         }
     }
+
+    [UsedImplicitly]
+    public static void Deconstruct<TKey, TValue>(
+        //DON'T TOUCH THIS, it tries to deconstruct the deconstruct method...
+        // ReSharper disable once UseDeconstructionOnParameter
+        this KeyValuePair<TKey, TValue> self,
+        out TKey key,
+        out TValue value
+    )
+    {
+        key = self.Key;
+        value = self.Value;
+    }
+
+    public static void CheckFailFast(this Exception? reason)
+    {
+        if (reason is not OutOfMemoryException)
+        {
+            return;
+        }
+
+        Console.WriteLine("[Fatal] Out of memory exception" + reason);
+        Environment.FailFast(reason.Message, reason);
+    }
+
+    public static Process Configure(this Process self)
+    {
+        var system = self.System;
+        return system.Config.ConfigureProcess(self);
+    }
+
+    public static Func<T, T> Wrap<T>(this Func<T, T> self, Func<T, T> outer) =>
+        x => outer(self(x));
 }

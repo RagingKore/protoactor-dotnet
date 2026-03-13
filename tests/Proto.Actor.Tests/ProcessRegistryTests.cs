@@ -1,92 +1,137 @@
 ﻿using System;
+using System.Linq;
+using System.Threading.Tasks;
 using Proto.TestFixtures;
 using Xunit;
 
-namespace Proto.Tests
+namespace Proto.Tests;
+
+public class ProcessRegistryTests
 {
-    public class ProcessRegistryTests
+    [Fact]
+    public async Task Given_PIDDoesNotExist_TryAddShouldAddLocalPID()
     {
-        private static readonly ActorSystem System = new();
+        var system = new ActorSystem();
+        await using var _ = system;
+        var id = Guid.NewGuid().ToString();
+        var p = new TestProcess(system);
+        var reg = new ProcessRegistry(system);
 
-        [Fact]
-        public void Given_PIDDoesNotExist_TryAddShouldAddLocalPID()
-        {
-            var id = Guid.NewGuid().ToString();
-            var p = new TestProcess(System);
-            var reg = new ProcessRegistry(System);
+        var (pid, ok) = reg.TryAdd(id, p);
 
-            var (pid, ok) = reg.TryAdd(id, p);
+        Assert.True(ok);
+        Assert.Equal(system.Address, pid.Address);
+        Assert.Equal(id, pid.Id);
+    }
 
-            Assert.True(ok);
-            Assert.Equal(System.Address, pid.Address);
-        }
+    [Fact]
+    public async Task Given_PIDExists_TryAddShouldNotAddLocalPID()
+    {
+        var system = new ActorSystem();
+        await using var _ = system;
+        var id = Guid.NewGuid().ToString();
+        var p = new TestProcess(system);
+        var reg = new ProcessRegistry(system);
+        var (pid1, _) = reg.TryAdd(id, p);
 
-        [Fact]
-        public void Given_PIDExists_TryAddShouldNotAddLocalPID()
-        {
-            var id = Guid.NewGuid().ToString();
-            var p = new TestProcess(System);
-            var reg = new ProcessRegistry(System);
-            reg.TryAdd(id, p);
+        var (pid2, ok) = reg.TryAdd(id, p);
 
-            var (_, ok) = reg.TryAdd(id, p);
+        Assert.False(ok);
+        Assert.Equal(pid1.Id, pid2.Id);
+        Assert.Equal(pid1.Address, pid2.Address);
+    }
 
-            Assert.False(ok);
-        }
+    [Fact]
+    public async Task Given_PIDExists_GetShouldReturnIt()
+    {
+        var system = new ActorSystem();
+        await using var _ = system;
+        var id = Guid.NewGuid().ToString();
+        var p = new TestProcess(system);
+        var reg = new ProcessRegistry(system);
+        reg.TryAdd(id, p);
+        var (pid, _) = reg.TryAdd(id, p);
 
-        [Fact]
-        public void Given_PIDExists_GetShouldReturnIt()
-        {
-            var id = Guid.NewGuid().ToString();
-            var p = new TestProcess(System);
-            var reg = new ProcessRegistry(System);
-            reg.TryAdd(id, p);
-            var (pid, _) = reg.TryAdd(id, p);
+        var p2 = reg.Get(pid);
 
-            var p2 = reg.Get(pid);
+        Assert.Same(p, p2);
+        Assert.Equal(id, pid.Id);
+    }
 
-            Assert.Same(p, p2);
-        }
+    [Fact]
+    public async Task Given_PIDWasRemoved_GetShouldReturnDeadLetterProcess()
+    {
+        var system = new ActorSystem();
+        await using var _ = system;
+        var id = Guid.NewGuid().ToString();
+        var p = new TestProcess(system);
+        var reg = new ProcessRegistry(system);
+        var (pid, _) = reg.TryAdd(id, p);
+        reg.Remove(pid);
 
-        [Fact]
-        public void Given_PIDWasRemoved_GetShouldReturnDeadLetterProcess()
-        {
-            var id = Guid.NewGuid().ToString();
-            var p = new TestProcess(System);
-            var reg = new ProcessRegistry(System);
-            var (pid, _) = reg.TryAdd(id, p);
-            reg.Remove(pid);
+        var p2 = reg.Get(pid);
 
-            var p2 = reg.Get(pid);
+        Assert.Same(system.DeadLetter, p2);
+    }
 
-            Assert.Same(System.DeadLetter, p2);
-        }
+    [Fact]
+    public async Task Given_PIDExistsInHostResolver_GetShouldReturnIt()
+    {
+        var system = new ActorSystem();
+        await using var _ = system;
+        var pid = new PID();
+        var p = new TestProcess(system);
+        var reg = new ProcessRegistry(system);
+        reg.RegisterHostResolver(x => p);
 
-        [Fact]
-        public void Given_PIDExistsInHostResolver_GetShouldReturnIt()
-        {
-            var pid = new PID();
-            var p = new TestProcess(System);
-            var reg = new ProcessRegistry(System);
-            reg.RegisterHostResolver(x => p);
+        var p2 = reg.Get(pid);
 
-            var p2 = reg.Get(pid);
+        Assert.Same(p, p2);
+    }
 
-            Assert.Same(p, p2);
-        }
+    [Fact]
+    public async Task Given_ProcessRegistry_NextIdShouldReturnSequentialIds()
+    {
+        var system = new ActorSystem();
+        await using var _ = system;
+        var reg = new ProcessRegistry(system);
 
-        [Fact]
-        public void Given_PIDExistsInClientResolver_GetShouldReturnIt()
-        {
-            var pid = new PID();
-            pid.Address = System.Address;
-            var p = new TestProcess(System);
-            var reg = new ProcessRegistry(System);
-            reg.RegisterClientResolver(x => p);
+        var id1 = reg.NextId();
+        var id2 = reg.NextId();
 
-            var p2 = reg.Get(pid);
+        Assert.Equal("$1", id1);
+        Assert.Equal("$2", id2);
+    }
 
-            Assert.Same(p, p2);
-        }
+    [Fact]
+    public async Task Given_PIDs_FindShouldReturnMatchingPIDs()
+    {
+        var system = new ActorSystem();
+        await using var _ = system;
+        var reg = new ProcessRegistry(system);
+        var p1 = new TestProcess(system);
+        var p2 = new TestProcess(system);
+        var p3 = new TestProcess(system);
+        reg.TryAdd("alpha", p1);
+        reg.TryAdd("beta", p2);
+        reg.TryAdd("ALPHANUM", p3);
+
+        var results = reg.Find("Alp").ToList();
+
+        Assert.Equal(2, results.Count);
+        Assert.All(results, pid => Assert.Equal(system.Address, pid.Address));
+        Assert.Contains(results, pid => pid.Id == "alpha");
+        Assert.Contains(results, pid => pid.Id == "ALPHANUM");
+    }
+
+    [Fact]
+    public async Task Given_RemotePIDWithoutResolver_GetShouldThrow()
+    {
+        var system = new ActorSystem();
+        await using var _ = system;
+        var reg = new ProcessRegistry(system);
+        var pid = PID.FromAddress("remote", "123");
+
+        Assert.Throws<NotSupportedException>(() => reg.Get(pid));
     }
 }

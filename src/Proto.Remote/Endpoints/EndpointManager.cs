@@ -1,169 +1,303 @@
-﻿// -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
 //   <copyright file="EndpointManager.cs" company="Asynkron AB">
-//       Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//       Copyright (C) 2015-2025 Asynkron AB All rights reserved
 //   </copyright>
 // -----------------------------------------------------------------------
 
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using Proto.Diagnostics;
 using Proto.Mailbox;
 
-namespace Proto.Remote
+namespace Proto.Remote;
+
+public sealed class EndpointManager : IDiagnosticsProvider
 {
-    public class EndpointManager
+    public const string ActivatorActorName = "$activator";
+
+    private static readonly ILogger Logger = Log.CreateLogger<EndpointManager>();
+    private readonly ConcurrentDictionary<string, DateTime> _blockedAddresses = new();
+    private readonly ConcurrentDictionary<string, DateTime> _blockedClientSystemIds = new();
+    private readonly IRemoteEndpoint _blockedEndpoint;
+    private readonly CancellationTokenSource _cancellationTokenSource = new();
+    private readonly ConcurrentDictionary<string, IRemoteEndpoint> _clientEndpoints = new();
+    private readonly EventStreamSubscription<object>? _endpointTerminatedEvnSub;
+    private readonly RemoteConfig _remoteConfig;
+    private readonly ConcurrentDictionary<string, IRemoteEndpoint> _serverEndpoints = new();
+    private readonly object _synLock = new();
+    private readonly ActorSystem _system;
+
+    public EndpointManager(ActorSystem system, RemoteConfig remoteConfig)
     {
-        private static readonly ILogger Logger = Log.CreateLogger<EndpointManager>();
-        private readonly CancellationTokenSource _cancellationTokenSource = new();
-        private readonly IChannelProvider _channelProvider;
-        private readonly ConcurrentDictionary<string, PID> _connections = new();
-        private readonly EventStreamSubscription<object> _deadLetterEvnSub;
-        private readonly EventStreamSubscription<object>? _endpointConnectedEvnSub;
-        private readonly EventStreamSubscription<object> _endpointErrorEvnSub;
-        private readonly EventStreamSubscription<object>? _endpointTerminatedEvnSub;
-        private readonly RemoteConfigBase _remoteConfig;
-        private readonly object _synLock = new();
-        private readonly ActorSystem _system;
-        private readonly ConcurrentDictionary<string, PID> _terminatedConnections = new();
+        _system = system;
+        _system.ProcessRegistry.RegisterHostResolver(pid => new RemoteProcess(_system, this, pid));
+        _remoteConfig = remoteConfig;
 
-        public EndpointManager(ActorSystem system, RemoteConfigBase remoteConfig, IChannelProvider channelProvider)
-        {
-            _system = system;
-            _system.ProcessRegistry.RegisterHostResolver(pid => new RemoteProcess(_system, this, pid));
-            _remoteConfig = remoteConfig;
-            _channelProvider = channelProvider;
-            _endpointTerminatedEvnSub = _system.EventStream.Subscribe<EndpointTerminatedEvent>(OnEndpointTerminated, Dispatchers.DefaultDispatcher);
-            _endpointConnectedEvnSub = _system.EventStream.Subscribe<EndpointConnectedEvent>(OnEndpointConnected);
-            _endpointErrorEvnSub = _system.EventStream.Subscribe<EndpointErrorEvent>(OnEndpointError);
-            _deadLetterEvnSub = _system.EventStream.Subscribe<DeadLetterEvent>(OnDeadLetterEvent);
-        }
+        _endpointTerminatedEvnSub =
+            _system.EventStream
+            .Subscribe<EndpointTerminatedEvent>(OnEndpointTerminated, Dispatchers.DefaultDispatcher);
 
-        public CancellationToken CancellationToken => _cancellationTokenSource.Token;
-        public PID? ActivatorPid { get; private set; }
+        _blockedEndpoint = new BlockedEndpoint(system);
+        RemoteMessageHandler = new RemoteMessageHandler(this, _system, _remoteConfig.Serialization, _remoteConfig);
+    }
 
-        private void OnDeadLetterEvent(DeadLetterEvent deadLetterEvent)
-        {
-            switch (deadLetterEvent.Message)
+    internal RemoteMessageHandler RemoteMessageHandler { get; }
+
+    public CancellationToken CancellationToken => _cancellationTokenSource.Token;
+    private PID? ActivatorPid { get; set; }
+
+    public void Start() => SpawnActivator();
+
+    public async Task StopAsync()
+    {
+        lock (_synLock)
+        {            
+            if (CancellationToken.IsCancellationRequested)
             {
-                case RemoteWatch msg:
-                    msg.Watcher.SendSystemMessage(_system, new Terminated
-                        {
-                            Why = TerminatedReason.AddressTerminated,
-                            Who = msg.Watchee
-                        }
-                    );
-                    break;
-                case RemoteDeliver rd:
-                    if (rd.Sender != null)
-                        _system.Root.Send(rd.Sender, new DeadLetterResponse {Target = rd.Target});
-                    _system.EventStream.Publish(new DeadLetterEvent(rd.Target, rd.Message, rd.Sender));
-                    break;
-            }
-        }
-
-        public void Start() => SpawnActivator();
-
-        public void Stop()
-        {
-            lock (_synLock)
-            {
-                if (CancellationToken.IsCancellationRequested) return;
-
-                Logger.LogDebug("[EndpointManager] Stopping");
-
-                _system.EventStream.Unsubscribe(_endpointTerminatedEvnSub);
-                _system.EventStream.Unsubscribe(_endpointConnectedEvnSub);
-                _system.EventStream.Unsubscribe(_endpointErrorEvnSub);
-                _system.EventStream.Unsubscribe(_deadLetterEvnSub);
-
-                var stopEndpointTasks = new List<Task>();
-
-                foreach (var endpoint in _connections.Values)
-                {
-                    stopEndpointTasks.Add(_system.Root.StopAsync(endpoint));
-                }
-
-                Task.WhenAll(stopEndpointTasks).GetAwaiter().GetResult();
-
-                _cancellationTokenSource.Cancel();
-
-                _connections.Clear();
-
-                StopActivator();
-
-                Logger.LogDebug("[EndpointManager] Stopped");
-            }
-        }
-
-        private void OnEndpointError(EndpointErrorEvent evt)
-        {
-            if (_connections.TryGetValue(evt.Address, out var endpoint))
-                endpoint.SendSystemMessage(_system, evt);
-        }
-
-        private void OnEndpointTerminated(EndpointTerminatedEvent evt)
-        {
-            Logger.LogDebug("[EndpointManager] Endpoint {Address} terminated removing from connections", evt.Address);
-
-            lock (_synLock)
-            {
-                if (_connections.TryRemove(evt.Address, out var endpoint))
-                {
-                    _system.Root.StopAsync(endpoint).GetAwaiter().GetResult();
-
-                    if (_remoteConfig.WaitAfterEndpointTerminationTimeSpan.HasValue && _terminatedConnections.TryAdd(evt.Address, endpoint))
-                    {
-                        _ = SafeTask.Run(async () => {
-                                await Task.Delay(_remoteConfig.WaitAfterEndpointTerminationTimeSpan.Value);
-                                _terminatedConnections.TryRemove(evt.Address, out var _);
-                            }
-                        );
-                    }
-                }
-            }
-        }
-
-        private void OnEndpointConnected(EndpointConnectedEvent evt)
-        {
-            var endpoint = GetEndpoint(evt.Address);
-            if (endpoint is null)
                 return;
+            }
 
-            endpoint.SendSystemMessage(_system, evt);
+            Logger.Stopping(_system.Address);
+
+            _system.EventStream.Unsubscribe(_endpointTerminatedEvnSub);
+
+            _cancellationTokenSource.Cancel();
+        }
+        
+        // release the lock while we dispose, other threads will see the cancellation token and return blocked endpoint.
+        foreach (var endpoint in _serverEndpoints.Values)
+        {
+            await endpoint.DisposeAsync().ConfigureAwait(false);
         }
 
-        internal PID? GetEndpoint(string address)
+        foreach (var endpoint in _clientEndpoints.Values)
         {
-            if (string.IsNullOrWhiteSpace(address)) throw new ArgumentNullException(nameof(address));
+            await endpoint.DisposeAsync().ConfigureAwait(false);
+        }
 
+        _serverEndpoints.Clear();
+        _clientEndpoints.Clear();
+
+        StopActivator();
+
+        Logger.Stopped(_system.Address);
+    }
+
+    private async Task OnEndpointTerminated(EndpointTerminatedEvent evt)
+    {
+        Logger.EndpointTerminating(_system.Address, evt.Address ?? evt.ActorSystemId);
+
+        Action? unblock = null;
+        try
+        {
+            IRemoteEndpoint? endpoint = null;
             lock (_synLock)
             {
-                if (_terminatedConnections.ContainsKey(address) || _cancellationTokenSource.IsCancellationRequested) return null;
+                if (_cancellationTokenSource.IsCancellationRequested)
+                {
+                    return;
+                }
 
-                return _connections.GetOrAdd(address, v => {
-                        Logger.LogDebug("[EndpointManager] Requesting new endpoint for {Address}", v);
-                        var props = Props
-                            .FromProducer(() => new EndpointActor(v, _remoteConfig, _channelProvider))
-                            .WithMailbox(() => new EndpointWriterMailbox(_system, _remoteConfig.EndpointWriterOptions.EndpointWriterBatchSize, v))
-                            .WithGuardianSupervisorStrategy(new EndpointSupervisorStrategy(v, _remoteConfig, _system));
-                        var endpointActorPid = _system.Root.SpawnNamed(props, $"endpoint-{v}");
-                        Logger.LogDebug("[EndpointManager] Created new endpoint for {Address}", v);
-                        return endpointActorPid;
-                    }
-                );
+                if (evt.Address is not null && _serverEndpoints.TryRemove(evt.Address, out endpoint))
+                {
+                    _blockedAddresses.TryAdd(evt.Address, DateTime.UtcNow);
+                    unblock = () => _blockedAddresses.TryRemove(evt.Address, out _);
+                }
+                else if (evt.ActorSystemId is not null && _clientEndpoints.TryRemove(evt.ActorSystemId, out endpoint))
+                {
+                    _blockedClientSystemIds.TryAdd(evt.ActorSystemId, DateTime.UtcNow);
+                    unblock = () => _blockedClientSystemIds.TryRemove(evt.ActorSystemId, out _);
+                }
+            }
+
+            if (endpoint != null)
+            {
+                // leave the lock to dispose the endpoint, so that requests can't build up behind the lock
+                // the address will always be blocked while we dispose, at a minimum
+                await endpoint.DisposeAsync().ConfigureAwait(false);
+
+                Logger.EndpointTerminated(_system.Address, evt.Address ?? evt.ActorSystemId);
+
+                if (evt.ShouldBlock && _remoteConfig.WaitAfterEndpointTerminationTimeSpan.HasValue)
+                {
+                    // Give remote transport a chance to release resources before reconnecting
+                    await Task.Delay(_remoteConfig.WaitAfterEndpointTerminationTimeSpan.Value, CancellationToken).ConfigureAwait(false);
+                }
+
+            }
+            else
+            {
+                Logger.EndpointAlreadyRemoved(_system.Address, evt.Address ?? evt.ActorSystemId);
             }
         }
-
-        private void SpawnActivator()
+        catch (Exception ex)
         {
-            var props = Props.FromProducer(() => new Activator(_remoteConfig, _system))
-                .WithGuardianSupervisorStrategy(Supervision.AlwaysRestartStrategy);
-            ActivatorPid = _system.Root.SpawnNamed(props, "activator");
+            // since these async EventStream subscription handlers are fire and forget, we need to
+            // log if something goes wrong, or we'll never know
+            Logger.ErrorDuringEndpointTermination(ex, _system.Address, evt.Address ?? evt.ActorSystemId);
+        }
+        finally
+        {
+            // make sure that the unblock action runs if it was set, or we can end up with a forever blocked address
+            // which is bad if a new endpoint is started with the same address, or the same one restarts and reconnects
+            unblock?.Invoke();
+        }
+    }
+
+    internal IRemoteEndpoint GetOrAddServerEndpoint(string? address)
+    {
+        if (address is null)
+        {
+            Logger.TriedGetEndpointForNullAddress(_system.Address);
+
+            return _blockedEndpoint;
         }
 
-        private void StopActivator() => _system.Root.Stop(ActivatorPid);
+        if (_cancellationTokenSource.IsCancellationRequested || _blockedAddresses.ContainsKey(address))
+        {
+            return _blockedEndpoint;
+        }
+
+        if (_serverEndpoints.TryGetValue(address, out var endpoint))
+        {
+            return endpoint;
+        }
+
+        lock (_synLock)
+        {
+            if (_cancellationTokenSource.IsCancellationRequested || _blockedAddresses.ContainsKey(address))
+            {
+                return _blockedEndpoint;
+            }
+            
+            if (_serverEndpoints.TryGetValue(address, out endpoint))
+            {
+                return endpoint;
+            }
+            
+            if (_system.Address.StartsWith(ActorSystem.Client, StringComparison.Ordinal))
+            {
+                if (Logger.IsEnabled(LogLevel.Debug))
+                {
+                    Logger.LogDebug("[{SystemAddress}] Requesting new client side ServerRemoteEndpoint for {Address}",
+                        _system.Address, address);
+                }
+
+                endpoint = _serverEndpoints.GetOrAdd(address,
+                    v => new ServerRemoteEndpoint(_system, _remoteConfig, v,
+                        ServerConnector.Type.ClientSide, RemoteMessageHandler));
+            }
+            else
+            {
+                if (Logger.IsEnabled(LogLevel.Debug))
+                {
+                    Logger.LogDebug("[{SystemAddress}] Requesting new server side ServerRemoteEndpoint for {Address}",
+                        _system.Address, address);
+                }
+
+                endpoint = _serverEndpoints.GetOrAdd(address,
+                    v => new ServerRemoteEndpoint(_system, _remoteConfig, v,
+                        ServerConnector.Type.ServerSide, RemoteMessageHandler));
+            }
+
+            return endpoint;
+        }
+    }
+
+    internal IRemoteEndpoint GetOrAddClientEndpoint(string systemId)
+    {
+        if (systemId is null)
+        {
+            Logger.LogError("[{SystemAddress}] Tried to get endpoint for null systemId", _system.Address);
+
+            return _blockedEndpoint;
+        }
+
+        if (_cancellationTokenSource.IsCancellationRequested || _blockedClientSystemIds.ContainsKey(systemId))
+        {
+            return _blockedEndpoint;
+        }
+
+        if (_clientEndpoints.TryGetValue(systemId, out var endpoint))
+        {
+            return endpoint;
+        }
+
+        lock (_synLock)
+        {
+            if (_cancellationTokenSource.IsCancellationRequested || _blockedClientSystemIds.ContainsKey(systemId))
+            {
+                return _blockedEndpoint;
+            }
+            
+            if (_clientEndpoints.TryGetValue(systemId, out endpoint))
+            {
+                return endpoint;
+            }
+
+            if (Logger.IsEnabled(LogLevel.Debug))
+            {
+                Logger.LogDebug("[{SystemAddress}] Requesting new ClientRemoteEndpoint for {SystemId}",
+                    _system.Address, systemId);
+            }
+
+            return _clientEndpoints.GetOrAdd(systemId,
+                address => new ClientRemoteEndpoint(_system, _remoteConfig, address));
+        }
+    }
+
+    internal IRemoteEndpoint GetServerEndpoint(string address)
+    {
+        if (_cancellationTokenSource.IsCancellationRequested || _blockedAddresses.ContainsKey(address))
+        {
+            return _blockedEndpoint;
+        }
+
+        if (_serverEndpoints.TryGetValue(address, out var endpoint))
+        {
+            return endpoint;
+        }
+
+        return _blockedEndpoint;
+    }
+
+    internal IRemoteEndpoint GetClientEndpoint(string systemId)
+    {
+        if (_cancellationTokenSource.IsCancellationRequested || _blockedClientSystemIds.ContainsKey(systemId))
+        {
+            return _blockedEndpoint;
+        }
+
+        if (_clientEndpoints.TryGetValue(systemId, out var endpoint))
+        {
+            return endpoint;
+        }
+
+        return _blockedEndpoint;
+    }
+
+    private void SpawnActivator()
+    {
+        var props = Props.FromProducer(() => new Activator(_remoteConfig, _system));
+        ActivatorPid = _system.Root.SpawnNamedSystem(props, ActivatorActorName);
+    }
+
+    private void StopActivator()
+    {
+        if (ActivatorPid is not null)
+        {
+            _system.Root.Stop(ActivatorPid);
+        }
+    }
+
+    public Task<DiagnosticsEntry[]> GetDiagnostics()
+    {
+        var endpoints = new DiagnosticsEntry("Remote", "Endpoints", _serverEndpoints.Keys.ToArray());
+
+        return Task.FromResult(new[] { endpoints });
     }
 }

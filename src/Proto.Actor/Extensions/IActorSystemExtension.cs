@@ -1,21 +1,30 @@
 // -----------------------------------------------------------------------
 // <copyright file="IActorSystemExtension.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
+using System;
 using System.Threading;
+using System.Threading.Tasks;
+using Proto.Diagnostics;
 
-namespace Proto.Extensions
+namespace Proto.Extensions;
+
+/// <summary>
+///     Marks a class as an actor system extension
+/// </summary>
+public interface IActorSystemExtension : IDiagnosticsProvider
 {
-    public interface IActorSystemExtension
-    {
-        private static int _nextId;
+    private static int _nextId;
 
-        internal static int GetNextId() => Interlocked.Increment(ref _nextId);
-    }
+    internal static int GetNextId() => Interlocked.Increment(ref _nextId);
+}
 
-    public interface IActorSystemExtension<T> : IActorSystemExtension where T : IActorSystemExtension
-    {
-        public static int Id = GetNextId();
-    }
+/// <summary>
+///     Marks a class as an actor system extension
+/// </summary>
+public interface IActorSystemExtension<T> : IActorSystemExtension where T : IActorSystemExtension
+{
+    public static int Id = GetNextId();
 }

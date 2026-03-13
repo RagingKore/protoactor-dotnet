@@ -1,56 +1,80 @@
 ﻿// -----------------------------------------------------------------------
 // <copyright file="CacheInvalidationExtensions.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
-using System;
-using System.Threading.Tasks;
+
 using Microsoft.Extensions.Logging;
 
-namespace Proto.Cluster.Cache
+namespace Proto.Cluster.Cache;
+
+public static class CacheInvalidationExtensions
 {
-    public static class CacheInvalidationExtensions
+    private static readonly ILogger Logger = Log.CreateLogger(nameof(CacheInvalidationExtensions));
+
+    /// <summary>
+    ///     Enable PidCache invalidation for ClusterKind. If invalidation is enabled, other members in the cluster will learn
+    ///     about
+    ///     the virtual actor deactivation on this cluster and will clear their <see cref="PidCache" />. If not enabled,
+    ///     other members will find out about stale entry in the PidCache when doing next request to this virtual actor.
+    ///     <br />
+    ///     Requires PidCacheInvalidation to be enabled on the Cluster. See <see cref="WithPidCacheInvalidation(Cluster)" />
+    /// </summary>
+    /// <param name="clusterKind"></param>
+    /// <returns></returns>
+    public static ClusterKind WithPidCacheInvalidation(this ClusterKind clusterKind) =>
+        clusterKind with { Props = clusterKind.Props.WithPidCacheInvalidation() };
+
+    /// <summary>
+    ///     Enable PidCache invalidation for the Cluster. If invalidation is enabled, other members in the cluster will learn
+    ///     about
+    ///     the virtual actor deactivation on this cluster and will clear their <see cref="PidCache" />. If not enabled,
+    ///     other members will find out about stale entry in the PidCache when doing next request to this virtual actor.
+    ///     <br />
+    ///     Invalidation also needs to be enabled for each ClusterKind which needs it individually. See
+    ///     <see cref="WithPidCacheInvalidation(ClusterKind)" />
+    /// </summary>
+    /// <param name="cluster"></param>
+    /// <returns></returns>
+    public static Cluster WithPidCacheInvalidation(this Cluster cluster)
     {
-        private static readonly ILogger Logger = Log.CreateLogger(nameof(CacheInvalidationExtensions));
+        _ = new ClusterCacheInvalidation(cluster);
 
-        public static Props WithPidCacheInvalidation(this Props props)
-            => props.WithContextDecorator(context => {
-                    var cacheInvalidation = context.System.Extensions.Get<ClusterCacheInvalidation>();
+        return cluster;
+    }
 
-                    if (cacheInvalidation is null)
+    private static Props WithPidCacheInvalidation(this Props props) =>
+        props.WithReceiverMiddleware(receiver =>
+            {
+                return (context, envelope) =>
+                {
+                    var task = receiver(context, envelope);
+
+                    if (envelope.Message is Started)
                     {
-                        Logger.LogWarning("ClusterCacheInvalidation extension is not registered");
-                        return context;
+                        Initialize(context);
+                    }
+                    else
+                    {
+                        context.Get<PidCacheInvalidator>()?.Invoke(envelope);
                     }
 
-                    return new CacheInvalidationContext(
-                        context,
-                        cacheInvalidation
-                    );
-                }
-            );
-
-        public static Cluster WithPidCacheInvalidation(this Cluster cluster)
-        {
-            _ = new ClusterCacheInvalidation(cluster);
-            return cluster;
-        }
-
-        private class CacheInvalidationContext : ActorContextDecorator
-        {
-            private readonly ClusterCacheInvalidation _plugin;
-            private Action<MessageEnvelope>? _callBack;
-
-            public CacheInvalidationContext(IContext context, ClusterCacheInvalidation cacheInvalidation) : base(context)
-                => _plugin = cacheInvalidation;
-
-            public override async Task Receive(MessageEnvelope envelope)
-            {
-                await base.Receive(envelope);
-
-                if (envelope.Message is ClusterInit init) _callBack = _plugin.ForActor(init.ClusterIdentity, Self!);
-                else _callBack?.Invoke(envelope);
+                    return task;
+                };
             }
+        );
+
+    private static void Initialize(IInfoContext context)
+    {
+        var plugin = context.System.Extensions.Get<ClusterCacheInvalidation>();
+
+        if (plugin is not null)
+        {
+            context.Set(plugin.GetInvalidator(context.Get<ClusterIdentity>()!, context.Self));
+        }
+        else
+        {
+            Logger.LogWarning("PidCacheInvalidation is not enabled on the cluster");
         }
     }
 }

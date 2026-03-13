@@ -1,16 +1,18 @@
 // -----------------------------------------------------------------------
 // <copyright file="TestKitException.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
 using System;
 
-namespace Proto.TestKit
+namespace Proto.TestKit;
+
+#pragma warning disable RCS1194
+public class TestKitException : Exception
+#pragma warning restore RCS1194
 {
-    public class TestKitException : Exception
+    public TestKitException(string message) : base(message)
     {
-        public TestKitException(string message) : base(message)
-        {
-        }
     }
 }

@@ -1,13 +1,16 @@
-[![Build status](https://ci.appveyor.com/api/projects/status/cmpnw19ur8j25xn4/branch/master?svg=true)](https://ci.appveyor.com/project/protoactor-ci/protoactor-dotnet/branch/master)
-
-### [Join our Slack channel](https://join.slack.com/t/asynkron/shared_invite/zt-ko824601-yGN1d3GHF9jzZX2VtONodQ)
+### [💬 Join our Slack channel](https://join.slack.com/t/asynkron/shared_invite/zt-ko824601-yGN1d3GHF9jzZX2VtONodQ)
 
 # Proto.Actor
+
 Ultra-fast, distributed, cross-platform actors.
 
 ## Bootcamp Training
 
 [https://github.com/AsynkronIT/protoactor-bootcamp](https://github.com/AsynkronIT/protoactor-bootcamp)
+
+## Stats
+
+![Alt](https://repobeats.axiom.co/api/embed/c9c21a6a706eda331cc8a38e4f03a7a844ed95f3.svg "Repobeats analytics image")
 
 ## Installing
 
@@ -16,10 +19,71 @@ Using NuGet Package Manager Console:
 `PM> Install-Package Proto.Actor`
 
 ## Source code
+
 This is the .NET repository for Proto Actor.
 
 Other implementations:
-* Go: [https://github.com/AsynkronIT/protoactor-go](https://github.com/AsynkronIT/protoactor-go)
+
+- Go: [https://github.com/AsynkronIT/protoactor-go](https://github.com/AsynkronIT/protoactor-go)
+
+## Documentation
+
+Additional root-level documents provide deeper insights into the project:
+
+- [CODEBASE_OVERVIEW.md](CODEBASE_OVERVIEW.md) – overview of the repository structure and key concepts.
+- [CLUSTER_MEMBERSHIP_GOSSIP.md](CLUSTER_MEMBERSHIP_GOSSIP.md) – explains how cluster membership is detected and propagated via gossip.
+- [EVENTSTREAM_EVENTS.md](EVENTSTREAM_EVENTS.md) – lists key EventStream events and their publishers/subscribers.
+- [SECURITY.md](SECURITY.md) – security policy and supported versions.
+- [Terminology.md](Terminology.md) – definitions of common Proto.Actor terms.
+
+## Test coverage
+
+You can capture code coverage directly when running the test projects. The .NET SDK ships an `XPlat Code Coverage` data collector that works across platforms, so you do not need any third-party tooling for the basic workflow.
+
+### Quick coverage run
+
+Run any test project with coverage enabled by passing the `CollectCoverage` property:
+
+```bash
+dotnet test /p:CollectCoverage=true
+```
+
+This uses the built-in collector and writes coverage data under the `TestResults` directory for the invocation.
+
+### Using coverlet.collector
+
+For richer reporting support you can opt into the `coverlet.collector` package. Add it to the test project you want to analyze:
+
+```bash
+dotnet add package coverlet.collector
+```
+
+Then request coverage when running the tests:
+
+```bash
+dotnet test --collect:"XPlat Code Coverage"
+```
+
+This produces a `.coverage` file under `TestResults/...` that can be converted into other formats.
+
+### Alternative output formats
+
+You can ask the collector to emit other formats such as Cobertura, lcov, or OpenCover. For example, to produce an `lcov` report:
+
+```bash
+dotnet test --collect:"XPlat Code Coverage" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=lcov
+```
+
+### HTML reports
+
+Feed the generated `lcov` or `cobertura` files into tools like [ReportGenerator](https://github.com/danielpalme/ReportGenerator) to build browsable HTML output. Install the global tool and point it at your coverage reports:
+
+```bash
+dotnet tool install -g dotnet-reportgenerator-globaltool
+reportgenerator -reports:**/coverage.cobertura.xml -targetdir:coveragereport
+```
+
+Open the files in the `coveragereport` directory to inspect the results.
 
 ## Design principles
 
@@ -73,11 +137,26 @@ context.Send(pid, new Hello("Alex"));
 
 You should see the output `Hello Alex`.
 
+## Sample application
+
+[https://github.com/asynkron/realtimemap-dotnet](https://github.com/asynkron/realtimemap-dotnet)
 
 ## Contributors
 
-<a href="https://github.com/AsynkronIT/protoactor-dotnet/graphs/contributors">
-  <img src="https://contributors-img.firebaseapp.com/image?repo=AsynkronIT/protoactor-dotnet" />
+<a href="https://github.com/asynkron/protoactor-dotnet/graphs/contributors">
+  <img src="https://contributors-img.web.app/image?repo=asynkron/protoactor-dotnet" />
 </a>
 
-Made with [contributors-img](https://contributors-img.firebaseapp.com).
+Made with [contributors-img](https://contributors-img.web.app).
+
+## Partners, Sponsors, and Contributor Companies
+
+<!-- make pretty with logos etc -->
+
+| Name                                     | Role                                  |
+| ---------------------------------------- | ------------------------------------- |
+| [Asynkron AB](https://asynkron.se)       | Founder and owner of Proto.Actor      |
+| Helleborg AS                             | Core contributor team                 |
+| [Ubiquitous AS](https://ubiquitous.no/)  | Core contributor team                 |
+| [Ahoy Games](https://www.ahoygames.com/) | Core contributor team                 |
+| [Etteplan](https://www.etteplan.com/)    | Contributing tutorials, documentation |

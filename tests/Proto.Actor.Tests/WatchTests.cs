@@ -1,92 +1,78 @@
 ﻿using System;
-using System.Threading;
 using System.Threading.Tasks;
+using Proto;
 using Proto.TestFixtures;
+using Proto.TestKit;
 using Xunit;
 
-namespace Proto.Tests
+namespace Proto.Tests;
+
+public class WatchTests
 {
-    public class WatchTests
+    [Fact]
+    public async Task MultipleStopsTriggerSingleTerminated()
     {
-        private static readonly ActorSystem System = new();
-        private static readonly RootContext Context = System.Root;
+        await using var system = new ActorSystem();
+        var context = system.Root;
 
-        [Fact]
-        public async Task MultipleStopsTriggerSingleTerminated()
+        var (probe, probePid) = system.CreateTestProbe();
+
+        // child stops itself twice when receiving "stop"
+        var childProps = Props.FromFunc(ctx =>
         {
-            var counter = 0;
-            var childProps = Props.FromFunc(context => {
-                    switch (context.Message)
-                    {
-                        case Started _:
-                            context.Stop(context.Self);
-                            context.Stop(context.Self);
-                            break;
-                    }
-
-                    return Task.CompletedTask;
-                }
-            );
-
-            Context.Spawn(Props.FromFunc(context => {
-                        switch (context.Message)
-                        {
-                            case Started _:
-                                context.Spawn(childProps);
-                                break;
-                            case Terminated _:
-                                Interlocked.Increment(ref counter);
-                                break;
-                        }
-
-                        return Task.CompletedTask;
-                    }
-                )
-            );
-
-            await Task.Delay(1000);
-            Assert.Equal(1, counter);
-        }
-
-        [Fact]
-        public async void CanWatchLocalActors()
-        {
-            var watchee = Context.Spawn(Props.FromProducer(() => new DoNothingActor())
-                .WithMailbox(() => new TestMailbox())
-            );
-            var watcher = Context.Spawn(Props.FromProducer(() => new LocalActor(watchee))
-                .WithMailbox(() => new TestMailbox())
-            );
-
-            await Context.StopAsync(watchee);
-            var terminatedMessageReceived = await Context.RequestAsync<bool>(watcher, "?", TimeSpan.FromSeconds(5));
-            Assert.True(terminatedMessageReceived);
-        }
-
-        public class LocalActor : IActor
-        {
-            private readonly PID _watchee;
-            private bool _terminateReceived;
-
-            public LocalActor(PID watchee) => _watchee = watchee;
-
-            public Task ReceiveAsync(IContext context)
+            if (ctx.Message is "stop")
             {
-                switch (context.Message)
-                {
-                    case Started _:
-                        context.Watch(_watchee);
-                        break;
-                    case string msg when msg == "?":
-                        context.Respond(_terminateReceived);
-                        break;
-                    case Terminated _:
-                        _terminateReceived = true;
-                        break;
-                }
-
-                return Task.CompletedTask;
+                ctx.Stop(ctx.Self);
+                ctx.Stop(ctx.Self);
             }
-        }
+
+            return Task.CompletedTask;
+        });
+
+        var child = context.Spawn(childProps);
+
+        // register probe as watcher for the child
+        child.SendSystemMessage(system, new Watch(probePid));
+
+        context.Send(child, "stop");
+
+        await probe.ExpectNextSystemMessageAsync<Terminated>(t => Equals(t.Who, child));
+        // ensure no additional messages are left in the probe
+        await probe.ExpectEmptyMailboxAsync();
+    }
+
+    [Fact]
+    public async Task CanWatchLocalActors()
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+
+        var watchee = context.Spawn(Props.FromProducer(() => new DoNothingActor()));
+
+        var (probe, probePid) = system.CreateTestProbe();
+
+        watchee.SendSystemMessage(system, new Watch(probePid));
+
+        await context.StopAsync(watchee);
+
+        await probe.ExpectNextSystemMessageAsync<Terminated>(t => Equals(t.Who, watchee));
+    }
+
+    [Fact]
+    public async Task UnwatchPreventsTerminatedMessage()
+    {
+        await using var system = new ActorSystem();
+        var context = system.Root;
+
+        var watchee = context.Spawn(Props.FromProducer(() => new DoNothingActor()));
+
+        var (probe, probePid) = system.CreateTestProbe();
+
+        watchee.SendSystemMessage(system, new Watch(probePid));
+        watchee.SendSystemMessage(system, new Unwatch(probePid));
+
+        await context.StopAsync(watchee);
+
+        await probe.ExpectNoMessageAsync(TimeSpan.FromMilliseconds(100));
     }
 }

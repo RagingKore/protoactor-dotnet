@@ -1,18 +1,18 @@
 // -----------------------------------------------------------------------
 // <copyright file="ContextState.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
 
 // ReSharper disable once CheckNamespace
-namespace Proto
+
+namespace Proto;
+
+//the lifecycle of an actor
+internal enum ContextState : byte
 {
-    //the lifecycle of an actor
-    enum ContextState : byte
-    {
-        Alive,      //default state
-        Restarting, //after being restarted by supervisor
-        Stopping,   //initiating stop, all context members still functional
-        Stopped     //actor is fully stopped, Self PID goes to DeadLetter
-    }
+    Alive, //default state
+    Restarting, //after being restarted by supervisor
+    Stopping, //initiating stop, all context members still functional
+    Stopped //actor is fully stopped, Self PID goes to DeadLetter
 }

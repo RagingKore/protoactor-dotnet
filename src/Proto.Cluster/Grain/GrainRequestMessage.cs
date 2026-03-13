@@ -1,28 +1,48 @@
 // -----------------------------------------------------------------------
 // <copyright file="Extensions.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2021 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
+using System;
 using Google.Protobuf;
+using Proto.Diagnostics;
+using Proto.Extensions;
 using Proto.Remote;
 
-namespace Proto.Cluster
-{
-    public record GrainRequestMessage(int MethodIndex, IMessage RequestMessage) : IRootSerializable
-    {
+namespace Proto.Cluster;
 
-        //serialize into the on-the-wire format
-        public IRootSerialized Serialize(ActorSystem system)
+/// <summary>
+///     A request message wrapper used for code-generated virtual actors (grains).
+/// </summary>
+/// <param name="MethodIndex">Index of the code generated method that should process the request message</param>
+/// <param name="RequestMessage">Wrapped message</param>
+public record GrainRequestMessage(int MethodIndex, IMessage? RequestMessage) : IRootSerializable, IDiagnosticsTypeName
+{
+    //serialize into the on-the-wire format
+    public IRootSerialized Serialize(ActorSystem system)
+    {
+        if (RequestMessage is null)
         {
-            var ser = system.Serialization();
-            var typeName = ser.GetTypeName(RequestMessage, ser.DefaultSerializerId);
-            var data = ser.Serialize(RequestMessage, ser.DefaultSerializerId);
-            return new GrainRequest
-            {
-                MethodIndex = MethodIndex,
-                MessageData = data,
-                MessageTypeName = typeName,
-            };
+            return new GrainRequest { MethodIndex = MethodIndex };
         }
+
+        var ser = system.Serialization();
+        var (data, typeName, serializerId) = ser.Serialize(RequestMessage);
+#if DEBUG
+        if (serializerId != Serialization.SERIALIZER_ID_PROTOBUF)
+        {
+            throw new Exception($"Grains must use ProtoBuf types: {RequestMessage.GetType().FullName}");
+        }
+#endif
+
+        return new GrainRequest
+        {
+            MethodIndex = MethodIndex,
+            MessageData = data,
+            MessageTypeName = typeName
+        };
     }
+
+    public string GetTypeName() => RequestMessage.GetMessageTypeName();
 }

@@ -1,23 +1,26 @@
 // -----------------------------------------------------------------------
 // <copyright file="AlwaysRestartStrategy.cs" company="Asynkron AB">
-//      Copyright (C) 2015-2020 Asynkron AB All rights reserved
+//      Copyright (C) 2015-2025 Asynkron AB All rights reserved
 // </copyright>
 // -----------------------------------------------------------------------
+
 using System;
 
 // ReSharper disable once CheckNamespace
-namespace Proto
+namespace Proto;
+
+/// <summary>
+///     A supervision strategy that always restarts all of the children of the actor.
+/// </summary>
+public class AlwaysRestartStrategy : ISupervisorStrategy
 {
-    public class AlwaysRestartStrategy : ISupervisorStrategy
-    {
-        //always restart
-        public void HandleFailure(
-            ISupervisor supervisor,
-            PID child,
-            RestartStatistics rs,
-            Exception reason,
-            object? message
-        )
-            => supervisor.RestartChildren(reason, child);
-    }
+    //always restart
+    public void HandleFailure(
+        ISupervisor supervisor,
+        PID child,
+        RestartStatistics rs,
+        Exception reason,
+        object? message
+    ) =>
+        supervisor.RestartChildren(reason, child);
 }

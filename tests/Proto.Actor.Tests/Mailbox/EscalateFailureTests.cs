@@ -1,171 +1,175 @@
 ﻿using System;
 using System.Threading.Tasks;
 using Proto.TestFixtures;
+using Proto.TestKit;
 using Xunit;
+using static Proto.TestKit.TestKit;
 
-namespace Proto.Mailbox.Tests
+namespace Proto.Mailbox.Tests;
+
+public class EscalateFailureTests
 {
-    public class EscalateFailureTests
+    [Fact]
+    public async Task GivenCompletedUserMessageTaskThrewException_ShouldEscalateFailure()
     {
-        [Fact]
-        public async Task GivenCompletedUserMessageTaskThrewException_ShouldEscalateFailure()
-        {
-            var mailboxHandler = new TestMailboxHandler();
-            var mailbox = UnboundedMailbox.Create();
-            mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
+        var mailboxHandler = new TestMailboxHandler();
+        var mailbox = UnboundedMailbox.Create();
+        mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
 
-            var msg1 = new TestMessageWithTaskCompletionSource();
-            var taskException = new Exception();
-            msg1.TaskCompletionSource.SetException(taskException);
+        var msg1 = new TestMessageWithTaskCompletionSource();
+        var taskException = new Exception();
+        msg1.TaskCompletionSource.SetException(taskException);
 
-            mailbox.PostUserMessage(msg1);
-            await mailboxHandler.HasFailures;
+        mailbox.PostUserMessage(msg1);
+        await AwaitConditionAsync(() => mailboxHandler.EscalatedFailures.Count == 1,
+            TimeSpan.FromMilliseconds(100));
 
-            Assert.Single(mailboxHandler.EscalatedFailures);
-            var e = Assert.IsType<Exception>(mailboxHandler.EscalatedFailures[0]);
-            Assert.Equal(taskException, e);
-        }
+        Assert.Single(mailboxHandler.EscalatedFailures);
+        var e = Assert.IsType<Exception>(mailboxHandler.EscalatedFailures[0]);
+        Assert.Equal(taskException, e);
+    }
 
-        [Fact]
-        public async Task GivenCompletedSystemMessageTaskThrewException_ShouldEscalateFailure()
-        {
-            var mailboxHandler = new TestMailboxHandler();
-            var mailbox = UnboundedMailbox.Create();
-            mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
+    [Fact]
+    public async Task GivenCompletedSystemMessageTaskThrewException_ShouldEscalateFailure()
+    {
+        var mailboxHandler = new TestMailboxHandler();
+        var mailbox = UnboundedMailbox.Create();
+        mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
 
-            var msg1 = new TestMessageWithTaskCompletionSource();
-            var taskException = new Exception();
-            msg1.TaskCompletionSource.SetException(taskException);
+        var msg1 = new TestMessageWithTaskCompletionSource();
+        var taskException = new Exception();
+        msg1.TaskCompletionSource.SetException(taskException);
 
-            mailbox.PostSystemMessage(msg1);
-            await mailboxHandler.HasFailures;
+        mailbox.PostSystemMessage(msg1);
+        await AwaitConditionAsync(() => mailboxHandler.EscalatedFailures.Count == 1,
+            TimeSpan.FromMilliseconds(100));
 
-            Assert.Single(mailboxHandler.EscalatedFailures);
-            var e = Assert.IsType<Exception>(mailboxHandler.EscalatedFailures[0]);
-            Assert.Equal(taskException, e);
-        }
+        Assert.Single(mailboxHandler.EscalatedFailures);
+        var e = Assert.IsType<Exception>(mailboxHandler.EscalatedFailures[0]);
+        Assert.Equal(taskException, e);
+    }
 
-        [Fact]
-        public async Task GivenNonCompletedUserMessageTaskThrewException_ShouldEscalateFailure()
-        {
-            var mailboxHandler = new TestMailboxHandler();
-            var mailbox = UnboundedMailbox.Create();
-            mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
+    [Fact]
+    public async Task GivenNonCompletedUserMessageTaskThrewException_ShouldEscalateFailure()
+    {
+        var mailboxHandler = new TestMailboxHandler();
+        var mailbox = UnboundedMailbox.Create();
+        mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
 
-            var msg1 = new TestMessageWithTaskCompletionSource();
+        var msg1 = new TestMessageWithTaskCompletionSource();
 
-            mailbox.PostUserMessage(msg1);
-            var taskException = new Exception();
+        mailbox.PostUserMessage(msg1);
+        var taskException = new Exception();
 
-            await Task.Delay(10);
-            msg1.TaskCompletionSource.SetException(taskException);
-            await mailboxHandler.HasFailures;
+        _ = Task.Run(() => msg1.TaskCompletionSource.SetException(taskException));
 
-            Assert.Single(mailboxHandler.EscalatedFailures);
-            var e = Assert.IsType<Exception>(mailboxHandler.EscalatedFailures[0]);
-            Assert.Equal(taskException, e);
-        }
+        await AwaitConditionAsync(() => mailboxHandler.EscalatedFailures.Count == 1,
+            TimeSpan.FromMilliseconds(100));
 
-        [Fact]
-        public async Task GivenNonCompletedSystemMessageTaskThrewException_ShouldEscalateFailure()
-        {
-            var mailboxHandler = new TestMailboxHandler();
-            var mailbox = UnboundedMailbox.Create();
-            mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
+        Assert.Single(mailboxHandler.EscalatedFailures);
+        var e = Assert.IsType<Exception>(mailboxHandler.EscalatedFailures[0]);
+        Assert.Equal(taskException, e);
+    }
 
-            var msg1 = new TestMessageWithTaskCompletionSource();
+    [Fact]
+    public async Task GivenNonCompletedSystemMessageTaskThrewException_ShouldEscalateFailure()
+    {
+        var mailboxHandler = new TestMailboxHandler();
+        var mailbox = UnboundedMailbox.Create();
+        mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
 
-            mailbox.PostSystemMessage(msg1);
-            
-            //make sure the message is being processed by the mailboxHandler
-            //e.g. await mailboxHandler.GotMessage()
-            await Task.Delay(10);
+        var msg1 = new TestMessageWithTaskCompletionSource();
 
-            //fail the current task being processed
-            var taskException = new Exception();
-            msg1.TaskCompletionSource.SetException(taskException);
-            
-            await mailboxHandler.HasFailures;
+        mailbox.PostSystemMessage(msg1);
 
-            Assert.Single(mailboxHandler.EscalatedFailures);
-            var e = Assert.IsType<Exception>(mailboxHandler.EscalatedFailures[0]);
-            Assert.Equal(taskException, e);
-        }
+        //fail the current task being processed
+        var taskException = new Exception();
+        _ = Task.Run(() => msg1.TaskCompletionSource.SetException(taskException));
 
-        [Fact]
-        public async Task GivenCompletedUserMessageTaskGotCancelled_ShouldEscalateFailure()
-        {
-            var mailboxHandler = new TestMailboxHandler();
-            var mailbox = UnboundedMailbox.Create();
-            mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
+        await AwaitConditionAsync(() => mailboxHandler.EscalatedFailures.Count == 1,
+            TimeSpan.FromMilliseconds(100));
 
-            var msg1 = new TestMessageWithTaskCompletionSource();
-            msg1.TaskCompletionSource.SetCanceled();
+        Assert.Single(mailboxHandler.EscalatedFailures);
+        var e = Assert.IsType<Exception>(mailboxHandler.EscalatedFailures[0]);
+        Assert.Equal(taskException, e);
+    }
 
-            mailbox.PostUserMessage(msg1);
-            await mailboxHandler.HasFailures;
+    [Fact]
+    public async Task GivenCompletedUserMessageTaskGotCancelled_ShouldEscalateFailure()
+    {
+        var mailboxHandler = new TestMailboxHandler();
+        var mailbox = UnboundedMailbox.Create();
+        mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
 
-            Assert.Single(mailboxHandler.EscalatedFailures);
-            Assert.IsType<TaskCanceledException>(mailboxHandler.EscalatedFailures[0]);
-        }
+        var msg1 = new TestMessageWithTaskCompletionSource();
+        msg1.TaskCompletionSource.SetCanceled();
 
-        [Fact]
-        public async Task GivenCompletedSystemMessageTaskGotCancelled_ShouldEscalateFailure()
-        {
-            var mailboxHandler = new TestMailboxHandler();
-            var mailbox = UnboundedMailbox.Create();
-            mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
+        mailbox.PostUserMessage(msg1);
+        await AwaitConditionAsync(() => mailboxHandler.EscalatedFailures.Count == 1,
+            TimeSpan.FromMilliseconds(100));
 
-            var msg1 = new TestMessageWithTaskCompletionSource();
-            msg1.TaskCompletionSource.SetCanceled();
+        Assert.Single(mailboxHandler.EscalatedFailures);
+        Assert.IsType<TaskCanceledException>(mailboxHandler.EscalatedFailures[0]);
+    }
 
-            mailbox.PostSystemMessage(msg1);
-            await mailboxHandler.HasFailures;
+    [Fact]
+    public async Task GivenCompletedSystemMessageTaskGotCancelled_ShouldEscalateFailure()
+    {
+        var mailboxHandler = new TestMailboxHandler();
+        var mailbox = UnboundedMailbox.Create();
+        mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
 
-            Assert.Single(mailboxHandler.EscalatedFailures);
-            Assert.IsType<TaskCanceledException>(mailboxHandler.EscalatedFailures[0]);
-        }
+        var msg1 = new TestMessageWithTaskCompletionSource();
+        msg1.TaskCompletionSource.SetCanceled();
 
-        [Fact]
-        public async Task GivenNonCompletedUserMessageTaskGotCancelled_ShouldEscalateFailure()
-        {
-            var mailboxHandler = new TestMailboxHandler();
-            var mailbox = UnboundedMailbox.Create();
-            mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
+        mailbox.PostSystemMessage(msg1);
+        await AwaitConditionAsync(() => mailboxHandler.EscalatedFailures.Count == 1,
+            TimeSpan.FromMilliseconds(100));
 
-            var msg1 = new TestMessageWithTaskCompletionSource();
+        Assert.Single(mailboxHandler.EscalatedFailures);
+        Assert.IsType<TaskCanceledException>(mailboxHandler.EscalatedFailures[0]);
+    }
 
-            mailbox.PostUserMessage(msg1);
-            
-            //this is a async message
-            await Task.Delay(10);
-            
-            msg1.TaskCompletionSource.SetCanceled();
-            await mailboxHandler.HasFailures;
+    [Fact]
+    public async Task GivenNonCompletedUserMessageTaskGotCancelled_ShouldEscalateFailure()
+    {
+        var mailboxHandler = new TestMailboxHandler();
+        var mailbox = UnboundedMailbox.Create();
+        mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
 
-            Assert.Single(mailboxHandler.EscalatedFailures);
-            Assert.IsType<TaskCanceledException>(mailboxHandler.EscalatedFailures[0]);
-        }
+        var msg1 = new TestMessageWithTaskCompletionSource();
 
-        [Fact]
-        public async Task GivenNonCompletedSystemMessageTaskGotCancelled_ShouldEscalateFailure()
-        {
-            var mailboxHandler = new TestMailboxHandler();
-            var mailbox = UnboundedMailbox.Create();
-            mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
+        mailbox.PostUserMessage(msg1);
 
-            var msg1 = new TestMessageWithTaskCompletionSource();
+        _ = Task.Run(() => msg1.TaskCompletionSource.SetCanceled());
 
-            //post the test message to the mailbox
-            mailbox.PostSystemMessage(msg1);
-            
-            //this is a async message
-            await Task.Delay(10);
-            msg1.TaskCompletionSource.SetCanceled();
-            await mailboxHandler.HasFailures;
+        await AwaitConditionAsync(
+            () => mailboxHandler.EscalatedFailures.Count == 1,
+            // allow additional time for the asynchronous cancellation to propagate
+            TimeSpan.FromMilliseconds(500));
 
-            Assert.Single(mailboxHandler.EscalatedFailures);
-            Assert.IsType<TaskCanceledException>(mailboxHandler.EscalatedFailures[0]);
-        }
+        Assert.Single(mailboxHandler.EscalatedFailures);
+        Assert.IsType<TaskCanceledException>(mailboxHandler.EscalatedFailures[0]);
+    }
+
+    [Fact]
+    public async Task GivenNonCompletedSystemMessageTaskGotCancelled_ShouldEscalateFailure()
+    {
+        var mailboxHandler = new TestMailboxHandler();
+        var mailbox = UnboundedMailbox.Create();
+        mailbox.RegisterHandlers(mailboxHandler, mailboxHandler);
+
+        var msg1 = new TestMessageWithTaskCompletionSource();
+
+        //post the test message to the mailbox
+        mailbox.PostSystemMessage(msg1);
+
+        _ = Task.Run(() => msg1.TaskCompletionSource.SetCanceled());
+
+        await AwaitConditionAsync(() => mailboxHandler.EscalatedFailures.Count == 1,
+            TimeSpan.FromMilliseconds(100));
+
+        Assert.Single(mailboxHandler.EscalatedFailures);
+        Assert.IsType<TaskCanceledException>(mailboxHandler.EscalatedFailures[0]);
     }
 }
